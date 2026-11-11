@@ -54,7 +54,7 @@
 
 | 缺什么 | 影响 | 处理方式 |
 | --- | --- | --- |
-| 本机未安装 Xcode，只有 Command Line Tools（Swift 6.3.3） | App target 无法用 `xcodebuild` 编译和跑测试；README 中的测试命令依赖 Xcode | 需要用户安装 Xcode 或提供有 Xcode 的环境。安装后可以不用 sudo，用 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild ...` 指定。在这之前，各卡"构建"验收标为"阻塞" |
+| 本机未安装 Xcode，只有 Command Line Tools（Swift 6.3.3） | App target 无法用 `xcodebuild` 编译和跑测试；README 中的测试命令依赖 Xcode | 用户已决定在本机安装 Xcode（项目最低 iOS 26.2，需 Xcode 26.2 或更新）。安装后可以不用 sudo，用 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild ...` 指定。安装完成前，各卡"构建"验收标为"阻塞" |
 | 真机与 E-H 账号 | 各卡的真机验收只能由用户执行 | 实现完成后，把需要用户执行的验收场景列给用户 |
 
 可以尝试在 `Packages/` 下对单个 Swift package 执行 `swift build`，但未验证是否可行（依赖需要联网拉取，部分代码依赖 UIKit），不能替代 App target 编译。
@@ -91,12 +91,24 @@ macOS target 同样要编译通过（CONTRIBUTING.md 要求）。
 
 依赖关系：
 
+- 第 0 步不依赖其他步骤，必须在第一次给用户打包安装之前完成
 - 第 1、2 步改的文件不重叠，可以并行
 - 第 3 步在第 2 步之后（都改 DownloadManager）
 - 第 4 步在第 1、3 步之后
 - 第 5 步在第 2 步之后。它与第 3、4 步都改 DownloadManager，建议在第 4 步之后串行
 - 第 6 步在第 2、3 步之后
 - 第 7 步中详情页和评论部分不依赖其他步骤，随时可做；下载页封面跳转要在第 6 步之后做
+
+### 第 0 步：检查更新改为指向本 fork（无任务卡，细节在此）
+
+- 背景：App 内"检查更新"查的是上游仓库。上游 main 已比 1.3.1 新，安装 fork 版后会一直提示更新；用户若照提示装了上游的包且签名设置相同，会覆盖掉 fork 版（数据保留，fork 的功能丢失）
+- 改动（仓库地址统一改为 `liuyiyanq/EhViewer-Apple`）：
+  - `ehviewer apple/AppUpdateChecker.swift`：`releasesURL`（Releases API 地址）、`checkForUpdate` 中 `releaseURL` 的兜底地址、文件头注释中的参考链接
+  - `ehviewer apple/SettingsView.swift`：「源代码」按钮的链接
+- 要点：
+  - 版本比较只认纯数字段（`compareVersions` 会丢弃非数字部分），所以版本号和 Release tag 都用纯数字，tag 形如 `v1.3.2`
+  - fork 还没有 Release 时，接口返回 404：手动检查显示"暂无发布版本"，启动时自动检查不提示，无需额外处理
+- 完成标准：手动检查更新时请求的是 fork 的地址；「源代码」打开 fork 主页
 
 ### 第 1 步：阅读器本地页直接读文件（EH-1 主因 A）
 
@@ -198,6 +210,33 @@ macOS target 同样要编译通过（CONTRIBUTING.md 要求）。
   - 只有 `/g/` 画廊链接在 App 内打开，其他链接交给系统浏览器
   - 详情页头部优先用加载后的 `vm.detail?.info`
 - 完成标准：EH-5 验收表全部可交用户验证
+
+## 打包与升级安装
+
+由用户在本机用 Xcode 打包。签名工具（Sideloadly、AltStore、SideStore）安装时会用用户自己的 Apple ID 重签，所以只需产出未签名的 IPA，不需要证书。仓库里的 `deploy_ios.yml` 依赖上游作者的付费证书和 App Store Connect 密钥，不使用。
+
+打包命令（未实际运行过，第一次打包时验证）：
+
+```bash
+xcodebuild archive -project "ehviewer apple.xcodeproj" -scheme "ehviewer apple" -destination "generic/platform=iOS" -archivePath build/EhViewer.xcarchive CODE_SIGNING_ALLOWED=NO
+```
+
+```bash
+mkdir -p build/Payload && cp -R build/EhViewer.xcarchive/Products/Applications/*.app build/Payload/ && (cd build && zip -qry EhViewer.ipa Payload)
+```
+
+覆盖升级、保留旧数据的条件：
+
+- iOS 按"签名团队 + bundle ID"判断是不是同一个 App。两者都相同才是升级，`Documents/download/` 和 `Documents/eh.sqlite` 保留；任一不同，会装成另一个 App 或安装失败
+- 不得修改主 App 的 bundle ID `Stellatrix.ehviewer-apple`，也不得修改小组件的 bundle ID `Stellatrix.ehviewer-apple.EhDownloadWidget`
+- 用户签名时使用与安装 v1.3.1 时相同的 Apple ID、签名工具和 bundle ID 设置。部分签名工具会改写 bundle ID，签名前先在工具里核对已安装 App 的 bundle ID
+- 不新增删除型或改写型数据库迁移；旧格式下载目录原样识别（EH-4）
+- 每次安装新包前，提醒用户通过「文件」App 或访达，把 `download` 文件夹和 `eh.sqlite` 备份到电脑。下载目录不在 iCloud 备份范围内
+
+版本号与发布：
+
+- 每次打包前更新 `MARKETING_VERSION`（主 App 和小组件保持一致）和 `CURRENT_PROJECT_VERSION`，具体数字待用户确定（建议从 1.3.2 起，纯数字）
+- 在 fork 上创建 Release（tag 与版本号一致，附 IPA）后，已安装的 App 才能检查到更新。创建 tag、Release 和上传都要用户确认
 
 ## 任务卡更新规则
 
