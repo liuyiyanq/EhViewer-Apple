@@ -29,6 +29,9 @@ public actor EhAPI {
     /// 域名前置 + 不跟随重定向 (图片请求的回退)
     private let directImageSession: URLSession
 
+    /// 下载器图片专用 session：跟随重定向 (原图链接会 302 到 H@H 节点)，不写 URLCache
+    private let downloadImageSession: URLSession
+
     /// 最大重试次数 (超时/连接错误时自动重试)
     private static let maxRetries = 1
 
@@ -90,6 +93,13 @@ public actor EhAPI {
             delegate: DomainFrontingDelegate(blockRedirects: true),
             delegateQueue: nil
         )
+
+        let downloadImgConfig = URLSessionConfiguration.default
+        downloadImgConfig.timeoutIntervalForResource = 300
+        downloadImgConfig.httpCookieStorage = .shared
+        downloadImgConfig.urlCache = nil
+        downloadImgConfig.allowsCellularAccess = true
+        downloadImageSession = URLSession(configuration: downloadImgConfig)
     }
 
     // MARK: - 请求辅助
@@ -97,22 +107,30 @@ public actor EhAPI {
     /// 在发送请求前清洁 Cookie，先走系统代理/VPN，失败后回退到域名前置直连
     /// 离线时回退到 URLCache 缓存数据 (避免已浏览内容在断网时不可用)
     /// 对应 Android: OkHttp 默认使用内置 DNS，iOS 需手动实现回退逻辑
-    private func sanitizedData(for request: URLRequest) async throws -> (Data, URLResponse) {
+    private func sanitizedData(
+        for request: URLRequest, priority: EhRateLimiter.Priority = .interactive
+    ) async throws -> (Data, URLResponse) {
         if let url = request.url {
             EhCookieManager.shared.sanitizeCookiesForRequest(url: url)
         }
 
-        // 全局 API 速率限制 — 防止 IP 封禁 (V-08)
-        await EhRateLimiter.shared.waitApiSlot()
+        // 全局 API 速率限制 — 防止 IP 封禁 (V-08)；排队中被取消直接抛出，不再发请求
+        try await EhRateLimiter.shared.waitApiSlot(priority: priority)
 
         do {
-            return try await executeWithRetry(maxRetries: Self.maxRetries) {
+            let result = try await executeWithRetry(maxRetries: Self.maxRetries) {
                 try await self.session.data(for: request)
             }
+            try Self.checkOpeningTooFast(result.0)
+            return result
         } catch let error where Self.shouldTryDirectFallback(error) {
             // 主要路径失败 → 尝试域名前置直连 (对应 Android 内置 DNS)
             do {
-                return try await attemptDomainFronting(for: request, using: directSession, originalError: error)
+                let result = try await attemptDomainFronting(for: request, using: directSession, originalError: error)
+                try Self.checkOpeningTooFast(result.0)
+                return result
+            } catch EhError.openingPagesTooFast {
+                throw EhError.openingPagesTooFast
             } catch {
                 // 域名前置也失败 → 最后尝试离线缓存回退
                 if let cachedResponse = Self.offlineCacheFallback(for: request) {
@@ -136,7 +154,7 @@ public actor EhAPI {
         }
 
         // 全局 API 速率限制 — 防止 IP 封禁 (V-08)
-        await EhRateLimiter.shared.waitApiSlot()
+        try await EhRateLimiter.shared.waitApiSlot()
 
         do {
             return try await executeWithRetry(maxRetries: Self.maxRetries) {
@@ -145,6 +163,15 @@ public actor EhAPI {
         } catch let error where Self.shouldTryDirectFallback(error) {
             return try await attemptDomainFronting(for: request, using: directImageSession, originalError: error)
         }
+    }
+
+    /// E-H 请求过快时返回 200 和一段提示文字，不识别就会被当成解析失败
+    private static func checkOpeningTooFast(_ data: Data) throws {
+        // 提示页很短，正常页面不必整段转字符串
+        guard data.count < 4096,
+              let body = String(data: data, encoding: .utf8),
+              body.contains("opening pages too fast") else { return }
+        throw EhError.openingPagesTooFast
     }
 
     // MARK: - 域名前置回退 (对应 Android OkHttp Dns 接口)
@@ -414,7 +441,8 @@ public actor EhAPI {
     /// 获取图片页面信息 (对应 Android getGalleryPageApi, JSON API: showpage)
     public func getGalleryPageApi(
         gid: Int64, index: Int, pToken: String,
-        showKey: String, previousPToken: String? = nil
+        showKey: String, previousPToken: String? = nil,
+        priority: EhRateLimiter.Priority = .interactive
     ) async throws -> GalleryPageResult {
         let site = AppSettings.shared.gallerySite
         guard let url = URL(string: EhURL.apiUrl(for: site)) else {
@@ -445,7 +473,7 @@ public actor EhAPI {
             origin: EhURL.origin(for: site)
         )
 
-        let (data, response) = try await sanitizedData(for: request)
+        let (data, response) = try await sanitizedData(for: request, priority: priority)
         try checkResponse(response, data: data)
 
         return try GalleryPageApiParser.parse(data)
@@ -814,7 +842,9 @@ public actor EhAPI {
     // MARK: - 画廊页面 HTML 解析 (对应 Android getGalleryPage)
 
     /// 获取画廊图片页面 (对应 Android getGalleryPage - HTML版本)
-    public func getGalleryPage(url: String) async throws -> GalleryPageResult {
+    public func getGalleryPage(
+        url: String, priority: EhRateLimiter.Priority = .interactive
+    ) async throws -> GalleryPageResult {
         guard let requestUrl = URL(string: url) else {
             throw EhError.invalidUrl
         }
@@ -825,7 +855,7 @@ public actor EhAPI {
             referer: EhURL.referer(for: site)
         )
 
-        let (data, response) = try await sanitizedData(for: request)
+        let (data, response) = try await sanitizedData(for: request, priority: priority)
         try checkResponse(response, data: data)
 
         let body = String(data: data, encoding: .utf8) ?? ""
@@ -840,7 +870,9 @@ public actor EhAPI {
     /// ⚠️ 阅读器以前用裸 URLSession 直接抓 `/s/` 页面，绕过了上面所有回退逻辑，
     ///    因此在 DNS 污染 / SNI 拦截的网络下"列表和预览正常、点进阅读就报 TLS 错误"
     ///    (issue #6)。凡是需要自行解析 HTML 的场景都应走这里。
-    public func fetchHTML(url: String, referer: String? = nil) async throws -> String {
+    public func fetchHTML(
+        url: String, referer: String? = nil, priority: EhRateLimiter.Priority = .interactive
+    ) async throws -> String {
         guard let requestUrl = URL(string: url) else {
             throw EhError.invalidUrl
         }
@@ -849,7 +881,7 @@ public actor EhAPI {
             url: requestUrl,
             referer: referer ?? EhURL.referer(for: site)
         )
-        let (data, response) = try await sanitizedData(for: request)
+        let (data, response) = try await sanitizedData(for: request, priority: priority)
         try checkResponse(response, data: data, requestUrl: url)
         return String(data: data, encoding: .utf8) ?? ""
     }
@@ -867,6 +899,23 @@ public actor EhAPI {
             throw EhError.httpError(http.statusCode, "")
         }
         return data
+    }
+
+    /// 下载器的图片请求 — 连接类失败 (DNS 污染、TLS 被拦等) 时回退域名前置直连，与阅读器一致
+    /// 不占页面/接口限速，并发由调用方的图片槽位控制
+    public func fetchDownloadImage(url: URL, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let result: (Data, URLResponse)
+        do {
+            result = try await downloadImageSession.data(for: request)
+        } catch let error where Self.shouldTryDirectFallback(error) {
+            result = try await attemptDomainFronting(for: request, using: directSession, originalError: error)
+        }
+        guard let http = result.1 as? HTTPURLResponse else {
+            throw EhError.networkError("Invalid response")
+        }
+        return (result.0, http)
     }
 
     // MARK: - 以图搜图 (对应 Android imageSearch)
@@ -1358,6 +1407,8 @@ public enum EhError: LocalizedError, Sendable {
     /// IP 被临时封禁 (对应 Android EhEngine 的 "temporarily banned" 检测)
     /// 服务端返回的是正常 200 页面，不特判就会解析出 0 条画廊、界面一片空白
     case ipBanned(String)
+    /// E-H 提示"页面打开太快" (200 + 提示文字)
+    case openingPagesTooFast
 
     public var errorDescription: String? {
         switch self {
@@ -1376,6 +1427,7 @@ public enum EhError: LocalizedError, Sendable {
         case .pining: return "该画廊已被删除 (pining for the fjords)"
         case .galleryUnavailable: return "该画廊不可用"
         case .serverError(let msg): return msg
+        case .openingPagesTooFast: return "请求过于频繁，请稍后再试"
         case .ipBanned(let detail):
             return detail.isEmpty
                 ? "当前 IP 被 E-Hentai 临时封禁。换一个 VPN 节点，或等待封禁自动解除。"

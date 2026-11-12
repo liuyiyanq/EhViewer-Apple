@@ -1,7 +1,7 @@
 import Foundation
 import EhModels
 import EhSettings
-import EhParser
+import EhAPI
 
 // MARK: - SpiderQueen (对应 Android SpiderQueen.java)
 // 画廊图片加载引擎核心，使用 Swift Actor 保证线程安全
@@ -30,28 +30,33 @@ public actor SpiderQueen {
     private var imageUrls: [String?]    // 每页的图片 URL
     private var showKey: String?        // showpage API 的 showKey
     private var activeTasks: [Int: Task<Void, Never>] = [:]
+    /// 下载模式的页面任务都在这个 Task 的 TaskGroup 里，cancelAll 取消它才能停住下载
+    private var downloadTask: Task<Void, Never>?
+    /// 进行中的详情页请求 (按详情页号)，同一个详情页只请求一次
+    private var detailPageLoads: [Int: Task<Void, Error>] = [:]
+    /// 图片配额已用完 (509)：剩余页不再派发
+    public private(set) var isImageLimitReached = false
+
+    /// 单页最多尝试次数 (对齐 Android SpiderWorker 最多 5 次)：用完即判失败，让出线程给后面的页
+    private static let maxPageAttempts = 5
+    /// 同一页最多换几个 H@H 节点 (与阅读器一致)
+    private static let maxSkipHathKeys = 3
+
+    private static let pTokenPattern = try! NSRegularExpression(pattern: #"/s/([0-9a-f]+)/\d+-(\d+)"#)
 
     /// 并发下载数 — 从 AppSettings 读取用户设置 (对齐 Android SpiderQueen.mWorkerPool 大小)
     private var maxConcurrent: Int {
         AppSettings.shared.multiThreadDownload
     }
 
-    /// 共享 URLSession — 超时从 AppSettings 读取 (对齐 Android okhttp timeouts)
-    private let sharedSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.httpCookieStorage = .shared
-        let timeout = TimeInterval(AppSettings.shared.downloadTimeout)
-        config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout * 4
-        return URLSession(configuration: config)
-    }()
-
-    /// 在全局速率限制下发起网络请求 — 防止跨实例并发失控 (V-09)
-    /// 所有 SpiderQueen 实例共享同一个 EhRateLimiter，全局最多 5 个并发图片请求
-    private func rateLimitedData(for request: URLRequest) async throws -> (Data, URLResponse) {
-        await EhRateLimiter.shared.acquireImageSlot()
+    /// 下载图片 — 全局最多 5 个并发图片请求 (V-09)；超时读设置值；
+    /// 走 EhAPI 获得域名前置回退。页面和接口请求另走 EhAPI 的下载档限速
+    private func fetchImage(url: URL) async throws -> (Data, HTTPURLResponse) {
+        try await EhRateLimiter.shared.acquireImageSlot()
         do {
-            let result = try await sharedSession.data(for: request)
+            let result = try await EhAPI.shared.fetchDownloadImage(
+                url: url, timeout: TimeInterval(AppSettings.shared.downloadTimeout)
+            )
             await EhRateLimiter.shared.releaseImageSlot()
             return result
         } catch {
@@ -68,20 +73,21 @@ public actor SpiderQueen {
 
     // MARK: - 生命周期
 
-    public init(galleryInfo: GalleryInfo, spiderInfo: SpiderInfo, mode: Mode = .read) {
+    /// - Parameter downloadDir: 画廊下载目录，由 DownloadManager 解析后传入
+    public init(galleryInfo: GalleryInfo, spiderInfo: SpiderInfo, mode: Mode = .read, downloadDir: URL) {
         self.galleryInfo = galleryInfo
         self.spiderInfo = spiderInfo
         self.mode = mode
-        self.spiderDen = SpiderDen(galleryInfo: galleryInfo)
+        // 模式在构造时确定：若用不等待的 Task 设置，首批页面可能在切换前写进阅读缓存
+        self.spiderDen = SpiderDen(
+            galleryInfo: galleryInfo,
+            mode: mode == .download ? .download : .read,
+            downloadDir: downloadDir
+        )
 
         let pageCount = galleryInfo.pages
         self.pageStates = Array(repeating: Self.stateNone, count: pageCount)
         self.imageUrls = Array(repeating: nil, count: pageCount)
-
-        // 设置 SpiderDen 模式
-        Task {
-            await spiderDen.setMode(mode == .download ? .download : .read)
-        }
     }
 
     // MARK: - 公共接口
@@ -132,12 +138,24 @@ public actor SpiderQueen {
 
         guard !pagesToDownload.isEmpty else { return }
 
-        // 使用 TaskGroup 配合信号量控制并发数 (对齐 Android SpiderQueen.mWorkerPool)
+        let task = Task { await self.downloadPages(pagesToDownload) }
+        downloadTask = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        downloadTask = nil
+    }
+
+    /// 使用 TaskGroup 配合信号量控制并发数 (对齐 Android SpiderQueen.mWorkerPool)
+    private func downloadPages(_ pagesToDownload: [Int]) async {
         await withTaskGroup(of: Void.self) { group in
             var inFlight = 0
             var index = 0
 
             while index < pagesToDownload.count {
+                if Task.isCancelled || isImageLimitReached { break }
                 if inFlight < maxConcurrent {
                     let pageIndex = pagesToDownload[index]
                     pageStates[pageIndex] = Self.stateLoading
@@ -187,6 +205,8 @@ public actor SpiderQueen {
             task.cancel()
         }
         activeTasks.removeAll()
+        downloadTask?.cancel()
+        downloadTask = nil
     }
 
     /// 设置回调代理
@@ -206,20 +226,31 @@ public actor SpiderQueen {
 
     // MARK: - 核心加载管线 (对应 Android SpiderQueen.run)
 
-    /// 加载单页图片 (对齐 Android SpiderWorker.downloadImage 最多重试 5 次)
+    /// 加载单页图片 (对齐 Android SpiderWorker.downloadImage)
     /// 管线: 检查缓存 → 获取 pToken → 构建页面 URL → 获取图片 URL → 下载图片 → 存储
+    /// 图片下载失败时带 nl= 重新取页面换 H@H 节点；E-H 提示请求过快时等冷却后重试，不计入失败
     private func loadPage(index: Int) async {
-        let maxRetries = 5
         var lastError: Error?
+        var attempt = 0
+        /// 最近一次页面返回的 nl key (对齐 Android skipHathKey)
+        var skipHathKey: String?
+        var usedSkipHathKeys: Set<String> = []
+        /// 下一次取页面时要带上的 nl key
+        var nextSkipHathKey: String?
 
-        for attempt in 0..<maxRetries {
+        while attempt < Self.maxPageAttempts {
+            if Task.isCancelled || isImageLimitReached {
+                markCancelled(index)
+                return
+            }
+            var downloadingImage = false
             do {
                 // 0. 检查是否已在缓存/下载目录中 (快速路径)
                 if await spiderDen.contain(index: index) {
                     pageStates[index] = Self.stateFinish
                     if let fileUrl = await spiderDen.getImageFileURL(index: index) {
                         imageUrls[index] = fileUrl.absoluteString
-                        await delegate?.onPageLoaded(index: index, imageUrl: fileUrl.absoluteString)
+                        await delegate?.onPageLoaded(index: index, imageUrl: fileUrl.absoluteString, networkBytes: 0)
                     }
                     activeTasks.removeValue(forKey: index)
                     return
@@ -228,37 +259,26 @@ public actor SpiderQueen {
                 // 1. 获取 pToken
                 let pToken = try await getPToken(for: index)
 
-                // 2. 获取图片 URL
-                let imageUrl: String
-                let originImageUrl: String?
-                if showKey == nil {
-                    let result = try await fetchPageHtml(gid: galleryInfo.gid, index: index, pToken: pToken)
-                    showKey = result.showKey
-                    imageUrl = result.imageUrl
-                    originImageUrl = result.originImageUrl
+                // 2. 获取图片 URL (换节点时必须走页面 HTML，showpage 接口不接受 nl)
+                let result: GalleryPageResult
+                if let currentShowKey = showKey, nextSkipHathKey == nil {
+                    result = try await fetchPageApi(index: index, pToken: pToken, showKey: currentShowKey)
                 } else {
-                    // showKey is guaranteed non-nil here
-                    let currentShowKey = showKey ?? ""
-                    let result = try await fetchPageApi(
-                        gid: galleryInfo.gid,
-                        index: index,
-                        pToken: pToken,
-                        showKey: currentShowKey
-                    )
-                    if let newShowKey = result.showKey {
-                        showKey = newShowKey
-                    }
-                    imageUrl = result.imageUrl
-                    originImageUrl = result.originImageUrl
+                    result = try await fetchPageHtml(index: index, pToken: pToken, skipHathKey: nextSkipHathKey)
                 }
+                nextSkipHathKey = nil
+                if let newShowKey = result.showKey {
+                    showKey = newShowKey
+                }
+                skipHathKey = result.skipHathKey
 
                 // 2.5 如果用户启用了"下载原始图片"且有原图 URL，优先使用 (对齐 Android downloadOriginImage)
                 let finalImageUrl: String
                 if AppSettings.shared.downloadOriginImage,
-                   let origin = originImageUrl, !origin.isEmpty {
+                   let origin = result.originImageUrl, !origin.isEmpty {
                     finalImageUrl = origin
                 } else {
-                    finalImageUrl = imageUrl
+                    finalImageUrl = result.imageUrl
                 }
 
                 // 3. URL 有效性
@@ -268,36 +288,47 @@ public actor SpiderQueen {
 
                 // 4. 509 检测
                 if finalImageUrl.contains("509.gif") || finalImageUrl.contains("509s.gif") {
-                    pageStates[index] = Self.stateFailed
-                    await delegate?.onImageLimitReached()
-                    activeTasks.removeValue(forKey: index)
-                    return
+                    throw SpiderError.imageLimitReached
                 }
 
                 // 5. 下载图片并存储
-                try await downloadAndStore(imageUrl: finalImageUrl, index: index)
+                downloadingImage = true
+                let networkBytes = try await downloadAndStore(imageUrl: finalImageUrl, index: index)
 
                 // 6. 保存结果
                 imageUrls[index] = finalImageUrl
                 pageStates[index] = Self.stateFinish
-                await delegate?.onPageLoaded(index: index, imageUrl: finalImageUrl)
+                await delegate?.onPageLoaded(index: index, imageUrl: finalImageUrl, networkBytes: networkBytes)
                 activeTasks.removeValue(forKey: index)
                 return
 
             } catch is CancellationError {
-                pageStates[index] = Self.stateNone
-                activeTasks.removeValue(forKey: index)
+                markCancelled(index)
+                return
+            } catch SpiderError.imageLimitReached {
+                await handleImageLimitReached(index)
                 return
             } catch {
+                if Task.isCancelled {
+                    markCancelled(index)
+                    return
+                }
                 lastError = error
+                // 图片下载失败多半是 H@H 节点不可用，带 nl= 重新取页面换一个节点；
+                // 服务器重复返回同一个 key 说明没有别的节点了 (对齐 Android leakSkipHathKey)
+                if downloadingImage, let key = skipHathKey, !key.isEmpty,
+                   !usedSkipHathKeys.contains(key), usedSkipHathKeys.count < Self.maxSkipHathKeys {
+                    usedSkipHathKeys.insert(key)
+                    nextSkipHathKey = key
+                }
                 // showKey 可能过期，清除后下次使用 HTML 方式
                 if attempt > 0 { showKey = nil }
-                // 使用用户配置的下载延迟 (downloadDelay, 毫秒) 作为基础，
-                // 结合指数退避: base * 2^attempt (对齐 Android SpiderQueen 重试策略)
-                if attempt < maxRetries - 1 {
-                    let userDelay = max(500, AppSettings.shared.downloadDelay)
-                    let delay = UInt64(userDelay) * UInt64(pow(2.0, Double(attempt))) * 1_000_000
-                    try? await Task.sleep(nanoseconds: delay)
+                attempt += 1
+                // 下载延迟 (downloadDelay, 毫秒) 为基础的指数退避：默认 0.5、1、2、4 秒
+                if attempt < Self.maxPageAttempts {
+                    let userDelay = Double(max(500, AppSettings.shared.downloadDelay))
+                    let delayMs = userDelay * pow(2.0, Double(attempt - 1))
+                    try? await Task.sleep(for: .milliseconds(Int(delayMs)))
                 }
             }
         }
@@ -308,19 +339,35 @@ public actor SpiderQueen {
         activeTasks.removeValue(forKey: index)
     }
 
+    /// 图片配额用完：剩余页也拿不到，停止派发并通知，整本由 DownloadManager 按磁盘判为失败
+    private func handleImageLimitReached(_ index: Int) async {
+        pageStates[index] = Self.stateFailed
+        activeTasks.removeValue(forKey: index)
+        guard !isImageLimitReached else { return }
+        isImageLimitReached = true
+        await delegate?.onImageLimitReached()
+        downloadTask?.cancel()
+    }
+
+    /// 取消后该页回到未加载状态，不计入失败
+    private func markCancelled(_ index: Int) {
+        pageStates[index] = Self.stateNone
+        activeTasks.removeValue(forKey: index)
+    }
+
     /// 下载图片并存储到 SpiderDen (对齐 Android: 共享 session 保持 cookies)
-    private func downloadAndStore(imageUrl: String, index: Int) async throws {
+    /// - Returns: 从网络下载的字节数
+    private func downloadAndStore(imageUrl: String, index: Int) async throws -> Int64 {
         guard let url = URL(string: imageUrl) else {
             throw SpiderError.invalidUrl
         }
 
-        // 使用带 cookies 的 session 下载图片
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        let (data, response) = try await rateLimitedData(for: request)
+        let (data, httpResponse) = try await fetchImage(url: url)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
+        if httpResponse.statusCode == 509 {
+            throw SpiderError.imageLimitReached
+        }
+        guard httpResponse.statusCode == 200 else {
             throw SpiderError.networkError
         }
 
@@ -343,10 +390,13 @@ public actor SpiderQueen {
             throw SpiderError.diskFull
         }
 
+        // 暂停或删除后不再落盘，避免把已删除的目录重新建出来
+        try Task.checkCancellation()
         let success = await spiderDen.write(data: data, index: index, extension: ext)
         if !success {
             throw SpiderError.storageFailed
         }
+        return Int64(data.count)
     }
 
     /// 获取图片扩展名
@@ -378,43 +428,22 @@ public actor SpiderQueen {
     // MARK: - pToken 管理
 
     /// 获取指定页面的 pToken (对齐 Android SpiderQueen.getPTokenFromInternet)
+    /// pToken 包含在详情页的预览链接中；每个详情页的缩略图数取决于账号设置，从第 0 页得出
     private func getPToken(for index: Int) async throws -> String {
         // 优先从 SpiderInfo 缓存获取
         if let token = spiderInfo.pTokenMap[index] {
             return token
         }
 
-        // 从网络获取: 请求画廊详情页对应的分页来获取 pToken
-        // 每页详情页显示 20 个预览缩略图，pToken 包含在预览链接中
-        let detailPage = index / 20
-        let site = AppSettings.shared.gallerySite
-        let siteUrl = EhURL.host(for: site)
-        let urlStr = "\(siteUrl)g/\(galleryInfo.gid)/\(galleryInfo.token)/\(detailPage > 0 ? "?p=\(detailPage)" : "")"
-        guard let url = URL(string: urlStr) else {
-            throw SpiderError.invalidUrl
+        if spiderInfo.previewPerPage <= 0 {
+            try await loadDetailPage(0)
+            if let token = spiderInfo.pTokenMap[index] {
+                return token
+            }
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
-        request.timeoutInterval = 15
-
-        let (data, _) = try await rateLimitedData(for: request)
-        let html = String(data: data, encoding: .utf8) ?? ""
-
-        // 从预览链接中提取 pTokens: /s/PTOKEN/GID-PAGE
-        let pattern = try! NSRegularExpression(pattern: #"/s/([0-9a-f]+)/\d+-(\d+)"#)
-        let matches = pattern.matches(in: html, range: NSRange(html.startIndex..., in: html))
-        for m in matches {
-            guard let ptRange = Range(m.range(at: 1), in: html),
-                  let pnRange = Range(m.range(at: 2), in: html) else { continue }
-            let pt = String(html[ptRange])
-            let pn = Int(html[pnRange]) ?? 0
-            spiderInfo.pTokenMap[pn - 1] = pt  // 1-based → 0-based
-        }
-
-        // 再次检查
+        let perPage = spiderInfo.previewPerPage > 0 ? spiderInfo.previewPerPage : 20
+        try await loadDetailPage(index / perPage)
         if let token = spiderInfo.pTokenMap[index] {
             return token
         }
@@ -422,95 +451,73 @@ public actor SpiderQueen {
         throw SpiderError.pTokenNotFound
     }
 
-    // MARK: - 网络请求
+    /// 同一个详情页只请求一次：并发的页面任务等待同一个请求的结果
+    private func loadDetailPage(_ detailPage: Int) async throws {
+        if let pending = detailPageLoads[detailPage] {
+            try await pending.value
+            return
+        }
+        let task = Task { try await self.fetchDetailPage(detailPage) }
+        detailPageLoads[detailPage] = task
+        defer { detailPageLoads[detailPage] = nil }
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
 
-    /// 通过 GET 获取页面 HTML (首次, 获取 showKey)
-    private func fetchPageHtml(gid: Int64, index: Int, pToken: String) async throws -> PageResult {
-        let site = AppSettings.shared.gallerySite
-        let urlString = EhURL.pageUrl(gid: gid, index: index, pToken: pToken, site: site)
-        guard let url = URL(string: urlString) else {
-            throw SpiderError.invalidUrl
+    /// 请求一个详情页，解析其中的 pToken；第 0 页同时得出每页缩略图数
+    private func fetchDetailPage(_ detailPage: Int) async throws {
+        let siteUrl = EhURL.host(for: AppSettings.shared.gallerySite)
+        let url = "\(siteUrl)g/\(galleryInfo.gid)/\(galleryInfo.token)/\(detailPage > 0 ? "?p=\(detailPage)" : "")"
+        let html = try await EhAPI.shared.fetchHTML(url: url, priority: .download)
+
+        // 从预览链接中提取 pTokens: /s/PTOKEN/GID-PAGE
+        var pagesOnDetailPage = Set<Int>()
+        let matches = Self.pTokenPattern.matches(in: html, range: NSRange(html.startIndex..., in: html))
+        for m in matches {
+            guard let ptRange = Range(m.range(at: 1), in: html),
+                  let pnRange = Range(m.range(at: 2), in: html),
+                  let pn = Int(html[pnRange]), pn > 0 else { continue }
+            spiderInfo.pTokenMap[pn - 1] = String(html[ptRange])  // 1-based → 0-based
+            pagesOnDetailPage.insert(pn)
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 15
-
-        let (data, response) = try await rateLimitedData(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw SpiderError.networkError
+        if detailPage == 0, spiderInfo.previewPerPage <= 0, !pagesOnDetailPage.isEmpty {
+            spiderInfo.previewPerPage = pagesOnDetailPage.count
         }
+    }
 
-        guard let html = String(data: data, encoding: .utf8) else {
-            throw SpiderError.invalidResponseData
+    // MARK: - 网络请求 (走 EhAPI 下载档：限速、域名前置回退、Cookie 清洁)
+
+    /// 通过 GET 获取页面 HTML (首次获取 showKey，或带 nl= 换 H@H 节点)
+    private func fetchPageHtml(index: Int, pToken: String, skipHathKey: String?) async throws -> GalleryPageResult {
+        var url = EhURL.pageUrl(gid: galleryInfo.gid, index: index, pToken: pToken, site: AppSettings.shared.gallerySite)
+        if let key = skipHathKey, !key.isEmpty {
+            url += (url.contains("?") ? "&" : "?") + "nl=\(key)"
         }
-
-        let result = try GalleryPageParser.parse(html)
-        return PageResult(
-            imageUrl: result.imageUrl,
-            showKey: result.showKey,
-            skipHathKey: result.skipHathKey,
-            originImageUrl: result.originImageUrl
-        )
+        return try await EhAPI.shared.getGalleryPage(url: url, priority: .download)
     }
 
     /// 通过 POST API 获取图片 URL (showpage)
-    private func fetchPageApi(gid: Int64, index: Int, pToken: String, showKey: String) async throws -> PageResult {
-        let site = AppSettings.shared.gallerySite
-        guard let url = URL(string: EhURL.apiUrl(for: site)) else {
-            throw SpiderError.invalidUrl
-        }
-
-        let jsonBody: [String: Any] = [
-            "method": "showpage",
-            "gid": gid,
-            "page": index + 1,   // 服务端 1-based
-            "imgkey": pToken,
-            "showkey": showKey
-        ]
-
-        let jsonData = try JSONSerialization.data(withJSONObject: jsonBody)
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(EhURL.referer(for: site), forHTTPHeaderField: "Referer")
-        request.setValue(EhURL.origin(for: site), forHTTPHeaderField: "Origin")
-        request.httpBody = jsonData
-        request.timeoutInterval = 15
-
-        let (data, response) = try await rateLimitedData(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw SpiderError.networkError
-        }
-
-        let result = try GalleryPageApiParser.parse(data)
-        return PageResult(
-            imageUrl: result.imageUrl,
-            showKey: result.showKey,
-            skipHathKey: result.skipHathKey,
-            originImageUrl: result.originImageUrl
+    private func fetchPageApi(index: Int, pToken: String, showKey: String) async throws -> GalleryPageResult {
+        try await EhAPI.shared.getGalleryPageApi(
+            gid: galleryInfo.gid,
+            index: index,
+            pToken: pToken,
+            showKey: showKey,
+            previousPToken: index > 0 ? spiderInfo.pTokenMap[index - 1] : nil,
+            priority: .download
         )
-    }
-
-    private struct PageResult {
-        var imageUrl: String
-        var showKey: String?
-        var skipHathKey: String?
-        var originImageUrl: String?
     }
 }
 
 // MARK: - SpiderDelegate
 
 public protocol SpiderDelegate: AnyObject, Sendable {
-    func onPageLoaded(index: Int, imageUrl: String) async
+    /// - Parameter networkBytes: 本次从网络下载的字节数；页面已在磁盘或阅读缓存中时为 0
+    func onPageLoaded(index: Int, imageUrl: String, networkBytes: Int64) async
     func onPageFailed(index: Int, error: Error) async
     func onImageLimitReached() async
     func onDownloadProgress(downloaded: Int, total: Int) async

@@ -77,42 +77,18 @@ public actor SpiderDen {
         }
     }
 
-    public init(galleryInfo: GalleryInfo) {
+    /// - Parameter downloadDir: 画廊下载目录，由 DownloadManager 按 gid 解析，
+    ///   不在这里按标题拼接（截断规则不一致时会写错目录）
+    public init(galleryInfo: GalleryInfo, mode: SpiderMode, downloadDir: URL) {
         self.gid = galleryInfo.gid
-        self.downloadDir = Self.getGalleryDownloadDir(galleryInfo: galleryInfo)
-    }
-
-    // MARK: - 下载目录管理
-
-    /// 获取画廊下载目录 (对应 Android getGalleryDownloadDir)
-    public static func getGalleryDownloadDir(galleryInfo: GalleryInfo) -> URL {
-        let baseDir = getDownloadLocation()
-        let dirname = sanitizeFilename("\(galleryInfo.gid)-\(galleryInfo.bestTitle)")
-        return baseDir.appendingPathComponent(dirname)
-    }
-
-    /// 获取下载根目录
-    public static func getDownloadLocation() -> URL {
-        #if os(macOS)
-        // macOS: 支持用户自定义路径
-        if let customPath = UserDefaults.standard.string(forKey: "downloadPath"),
-           !customPath.isEmpty {
-            return URL(fileURLWithPath: customPath)
-        }
-        #endif
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return docs.appendingPathComponent("download")
-    }
-
-    // MARK: - 模式设置
-
-    public func setMode(_ mode: SpiderMode) {
         self.mode = mode
-
+        self.downloadDir = downloadDir
         if mode == .download {
-            ensureDownloadDir()
+            try? FileManager.default.createDirectory(at: downloadDir, withIntermediateDirectories: true)
         }
     }
+
+    // MARK: - 模式
 
     public func getMode() -> SpiderMode {
         mode
@@ -220,7 +196,7 @@ public actor SpiderDen {
         let destFile = dir.appendingPathComponent(filename)
 
         do {
-            try data.write(to: destFile)
+            try data.write(to: destFile, options: .atomic)
             return true
         } catch {
             print("[SpiderDen] Failed to copy from cache: \(error)")
@@ -314,7 +290,8 @@ public actor SpiderDen {
     }
 
     private func writeToDownloadDir(data: Data, index: Int, extension ext: String) -> Bool {
-        guard ensureDownloadDir() else { return false }
+        // 下载已取消（暂停/删除）时不写，避免重建已删除的目录
+        guard !Task.isCancelled, ensureDownloadDir() else { return false }
 
         // 磁盘空间预检查: 至少需要 数据大小 + 10MB 余量
         let requiredBytes = Int64(data.count) + 10 * 1024 * 1024
@@ -327,7 +304,8 @@ public actor SpiderDen {
         let file = downloadDir.appendingPathComponent(filename)
 
         do {
-            try data.write(to: file)
+            // 原子写入：阅读器可能同时读这个文件，不能让它读到写了一半的图
+            try data.write(to: file, options: .atomic)
             return true
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileWriteOutOfSpaceError {
             print("[SpiderDen] ❌ 磁盘已满，无法写入页面 \(index)")
@@ -408,15 +386,6 @@ public actor SpiderDen {
         return nil
     }
 
-    // MARK: - 工具方法
-
-    /// 文件名清理
-    private static func sanitizeFilename(_ name: String) -> String {
-        let illegal = CharacterSet(charactersIn: "/\\:*?\"<>|")
-        let sanitized = name.components(separatedBy: illegal).joined(separator: "_")
-        let trimmed = sanitized.prefix(128)
-        return String(trimmed).trimmingCharacters(in: .whitespaces)
-    }
 }
 
 // MARK: - SpiderMode
@@ -473,7 +442,7 @@ final class SimpleDiskCache: @unchecked Sendable {
         let success: Bool = queue.sync {
             let file = fileURL(for: key)
             do {
-                try data.write(to: file)
+                try data.write(to: file, options: .atomic)
                 return true
             } catch {
                 return false

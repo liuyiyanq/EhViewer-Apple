@@ -33,5 +33,15 @@ let package = Package(
             dependencies: ["EhModels"],
             path: "Sources/EhSettings"
         ),
+        .testTarget(
+            name: "EhModelsTests",
+            dependencies: ["EhModels"],
+            path: "Tests/EhModelsTests"
+        ),
+        .testTarget(
+            name: "EhSettingsTests",
+            dependencies: ["EhSettings"],
+            path: "Tests/EhSettingsTests"
+        ),
     ]
 )

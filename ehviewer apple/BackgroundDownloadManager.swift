@@ -100,21 +100,25 @@ final class BackgroundDownloadManager: NSObject, @unchecked Sendable {
     private func handleBackgroundDownload(task: BGProcessingTask) {
         scheduleBackgroundDownload() // 重新调度下次
 
+        let completion = TaskCompletionOnce(task: task)
+
+        // 恢复下载队列中等待的任务，等队列下完或被系统叫停再报告完成
+        // (过早报告完成会让系统立即挂起 App，下载随之中断)
+        let work = Task {
+            await DownloadManager.shared.resumeAllWaiting()
+            while await DownloadManager.shared.isDownloading, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+            }
+            completion.complete(success: true)
+        }
+
         task.expirationHandler = {
             // BGProcessingTask 过期时, 暂停活跃下载 (保留 stateWait 以便恢复)
+            work.cancel()
             Task {
                 await DownloadManager.shared.pauseActiveIfNeeded()
             }
-            task.setTaskCompleted(success: false)
-        }
-
-        // 恢复下载队列中等待的任务
-        Task {
-            await DownloadManager.shared.resumeAllWaiting()
-            // 等待当前任务完成或被系统打断
-            // BGProcessingTask 最多有几分钟的执行时间
-            try? await Task.sleep(for: .seconds(2))
-            task.setTaskCompleted(success: true)
+            completion.complete(success: false)
         }
     }
 
@@ -213,6 +217,31 @@ extension BackgroundDownloadManager: URLSessionDownloadDelegate {
         }
     }
 }
+
+// MARK: - BGTask 完成回调只调用一次
+
+#if os(iOS) && !targetEnvironment(simulator)
+/// 下载结束和系统过期可能同时发生，setTaskCompleted 只能调用一次
+nonisolated private final class TaskCompletionOnce: @unchecked Sendable {
+    private let task: BGTask
+    private let lock = NSLock()
+    private var done = false
+
+    init(task: BGTask) {
+        self.task = task
+    }
+
+    func complete(success: Bool) {
+        lock.lock()
+        let shouldComplete = !done
+        done = true
+        lock.unlock()
+        if shouldComplete {
+            task.setTaskCompleted(success: success)
+        }
+    }
+}
+#endif
 
 // MARK: - Download Task Info
 
