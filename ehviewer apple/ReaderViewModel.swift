@@ -158,7 +158,6 @@ class ReaderViewModel {
     @ObservationIgnored private var preloadTask: Task<Void, Never>?
     /// 上一次预加载的锚点页 —— 用来推断翻页方向
     @ObservationIgnored private var lastPreloadAnchor: Int?
-    @ObservationIgnored private var downloadDir: URL?
 
     /// NSCache composite key: "gid:pageIndex" — 防止切换画廊时命中旧画廊的图片缓存
     private func cacheKey(for page: Int) -> NSString {
@@ -534,20 +533,19 @@ class ReaderViewModel {
         lastPreloadAnchor = nil
         loadingPages.removeAll()
         downloadingImages.removeAll()
-        downloadDir = nil
     }
 
     // MARK: - Setup (Fix D-1, B-1: 从 DownloadManager 查询真实下载状态，不再信任调用方传入的 Bool)
 
     /// 检查本地下载目录 — 替代旧的硬编码 `isDownloaded` + `gid-token` 路径
-    /// 有下载记录且目录里至少有一张图就启用本地读取，缺失的页由 loadPage 逐页回退网络
+    /// 画廊在下载列表中就启用本地读取（不要求已有图片），缺失的页由 loadPage 逐页回退网络
+    /// isDownloaded 的含义是"在下载列表中"，不是"整本已下完"
     func setupLocalGallery() async {
         // ★ 不再要求"整本下载完成"才读本地 (对齐 Android SpiderDen: 逐页判断)
         //   之前只要 isGalleryFullyDownloaded 判错 (下载中断、少一页、目录存在但文件不全)，
         //   整本都会退回网络加载 —— 表现为"下载完了还是很慢 / 断网完全打不开" (issue #8 问题二)
         //   loadPage 里本地文件缺失时仍会逐页回退网络，因此这里放宽是安全的
         let dir = await DownloadManager.shared.localGalleryDirectory(gid: gid)
-        self.downloadDir = dir
         self.isDownloaded = dir != nil
     }
 
@@ -662,6 +660,12 @@ class ReaderViewModel {
         }
         guard let urlString = imageURLs[index], let initialURL = URL(string: urlString) else { return }
         guard !downloadingImages.contains(index) else { return }
+
+        // 本地文件不走网络流程：逐字节读取、进度追踪、重试都跑在 MainActor 上，翻页会卡 2–3 秒
+        if initialURL.isFileURL {
+            await loadLocalImage(index, fileURL: initialURL)
+            return
+        }
         // 可变: 换 H@H 节点后 URL 会变 (对齐 Android SpiderQueen 的 nl= 重试)
         var url = initialURL
         downloadingImages.insert(index)
@@ -809,21 +813,53 @@ class ReaderViewModel {
         }
     }
 
-    /// 阅读时同步下载 — 浏览未下载的画廊时把看过的图片顺手存进下载目录
+    /// 读取并解码本地图片，读盘和解码都在后台执行
+    private func loadLocalImage(_ index: Int, fileURL: URL) async {
+        downloadingImages.insert(index)
+        defer { downloadingImages.remove(index) }
+
+        let img = await Task.detached(priority: .userInitiated) { () -> PlatformImage? in
+            guard let data = try? Data(contentsOf: fileURL) else { return nil }
+            return Self.downsampledImage(data: data)
+        }.value
+        if Task.isCancelled { return }
+
+        if let img {
+            Self.imageCache.setObject(img, forKey: cacheKey(for: index), cost: Self.decodedCost(of: img))
+            cachedImages[index] = img
+            downloadProgress.removeValue(forKey: index)
+            errorPages.remove(index)
+            evictDistantPages(from: currentPage)
+        } else {
+            errorPages.insert(index)
+            errorMessages[index] = "本地文件读取失败"
+            downloadProgress.removeValue(forKey: index)
+        }
+    }
+
+    /// 阅读时把在线加载成功的页存进下载目录
     ///
-    /// 对齐 Android 上游 2026-06-16「添加"阅读时同步下载"功能」。
-    /// Android 是在 SpiderDen 的写管道里分流；Apple 端阅读器自己下图，所以挂在这里。
-    /// 已经在读本地文件 (isDownloaded) 时不重复写。
+    /// - 下载列表中的画廊：一律保存，不受「阅读时同步下载」设置影响；下载器之后会跳过已存的页。
+    ///   开启「下载原图」时不保存，避免下载目录混入普通尺寸图片，由下载器下载原图
+    /// - 不在下载列表中的画廊：由「阅读时同步下载」设置决定 (对齐 Android 上游 2026-06-16
+    ///   「添加"阅读时同步下载"功能」。Android 是在 SpiderDen 的写管道里分流；Apple 端阅读器自己下图，所以挂在这里)
     private func syncDownloadIfEnabled(index: Int, data: Data, url: URL) async {
-        guard AppSettings.shared.syncDownloadWhileReading else { return }
-        guard !isDownloaded else { return }          // 本地已有整本，无需再存
         guard !url.isFileURL else { return }         // 读的就是本地文件
-        guard let info = GalleryCache.shared.getDetail(gid: gid)?.info else { return }
 
         // 扩展名优先用图片 URL 上的，拿不到就按数据头猜
         var ext = "." + url.pathExtension.lowercased()
         if url.pathExtension.isEmpty { ext = Self.imageExtension(for: data) }
 
+        if isDownloaded {
+            guard !AppSettings.shared.downloadOriginImage else { return }
+            await DownloadManager.shared.saveWhileReading(
+                gid: gid, pageIndex: index, data: data, extension: ext
+            )
+            return
+        }
+
+        guard AppSettings.shared.syncDownloadWhileReading else { return }
+        guard let info = GalleryCache.shared.getDetail(gid: gid)?.info else { return }
         await DownloadManager.shared.saveWhileReading(
             gallery: info, pageIndex: index, data: data, extension: ext
         )
@@ -912,9 +948,14 @@ class ReaderViewModel {
         guard index >= 0, index < totalPages else { return }
         guard imageURLs[index] == nil else { return }
         guard !loadingPages.contains(index) else { return }
+        loadingPages.insert(index)
+        defer { loadingPages.remove(index) }
 
         // 优先本地 (Fix D-1: 通过 DownloadManager 统一路径，本地找不到时回退网络)
-        if isDownloaded, let dir = downloadDir {
+        // 目录每次现查：阅读期间画廊可能被加入下载列表、移动到分组或在「文件」App 中改名
+        let dir = await DownloadManager.shared.localGalleryDirectory(gid: gid)
+        if isDownloaded != (dir != nil) { isDownloaded = dir != nil }
+        if let dir {
             if let localURL = SpiderInfoFile.getLocalImageURL(in: dir, pageIndex: index) {
                 await MainActor.run {
                     self.imageURLs[index] = localURL.absoluteString
@@ -933,9 +974,6 @@ class ReaderViewModel {
             }
             return
         }
-
-        loadingPages.insert(index)
-        defer { loadingPages.remove(index) }
 
         do {
             let site = GalleryActionService.siteBaseURL
@@ -984,7 +1022,21 @@ class ReaderViewModel {
         }
     }
 
+    /// 失败页是下载目录里读不出来的文件 (例如旧版本只写了一半)：原样重读没有用，要重新下载
+    func isLocalFileFailure(_ index: Int) -> Bool {
+        errorPages.contains(index) && localFileURL(index) != nil
+    }
+
+    private func localFileURL(_ index: Int) -> URL? {
+        guard let url = imageURLs[index].flatMap(URL.init(string:)), url.isFileURL else { return nil }
+        return url
+    }
+
     func retryLoadPage(_ index: Int) async {
+        // 删掉坏文件后 loadPage 找不到本地页，会走网络加载，成功后由 syncDownloadIfEnabled 存回下载目录
+        if isLocalFileFailure(index), let fileURL = localFileURL(index) {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
         await MainActor.run {
             self.imageURLs[index] = nil
             self.cachedImages.removeValue(forKey: index)

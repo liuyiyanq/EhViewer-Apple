@@ -747,7 +747,7 @@ struct ImageReaderView: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
-                Button("重新加载") {
+                Button(vm.isLocalFileFailure(index) ? "重新下载" : "重新加载") {
                     Task { await vm.retryLoadPage(index) }
                 }
                 .buttonStyle(.borderedProminent)
@@ -875,7 +875,7 @@ struct ImageReaderView: View {
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(.center)
-                Button("重新加载") {
+                Button(vm.isLocalFileFailure(index) ? "重新下载" : "重新加载") {
                     Task { await vm.retryLoadPage(index) }
                 }
                 .buttonStyle(.borderedProminent)
@@ -965,7 +965,7 @@ struct ImageReaderView: View {
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
                         .multilineTextAlignment(.center)
-                    Button("重新加载") {
+                    Button(vm.isLocalFileFailure(index) ? "重新下载" : "重新加载") {
                         Task { await vm.retryLoadPage(index) }
                     }
                     .buttonStyle(.borderedProminent)
