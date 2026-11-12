@@ -96,32 +96,62 @@ public struct SpiderInfoFile: Sendable {
     // MARK: - 扫描离线画廊
 
     /// 扫描下载目录，查找所有可用的离线画廊
+    ///
+    /// 扫描根目录和一层子目录：根目录下含 .ehviewer 的子目录是画廊，不含的是分组，
+    /// 分组内只认含 .ehviewer 的子目录（更深的层级忽略）。画廊身份只认 .ehviewer 中的 gid，不看目录名。
+    /// ⚠️ 只读取头部字段，返回的 SpiderInfo 中 pTokenMap 为空，**不要**写回磁盘。
     /// - Parameter downloadDirectory: 下载根目录
-    /// - Returns: (画廊目录 URL, SpiderInfo) 元组数组
+    /// - Returns: (画廊目录 URL, SpiderInfo) 元组数组，按目录名排序
     public static func scanOfflineGalleries(in downloadDirectory: URL) -> [(URL, SpiderInfo)] {
         var result: [(URL, SpiderInfo)] = []
+        for item in subdirectories(of: downloadDirectory) {
+            if exists(in: item) {
+                if let info = readHeader(from: item) {
+                    result.append((item, info))
+                }
+                continue
+            }
+            for child in subdirectories(of: item) {
+                if let info = readHeader(from: child) {
+                    result.append((child, info))
+                }
+            }
+        }
+        return result
+    }
 
+    /// 列出目录下的子目录（跳过隐藏项），按名称排序保证结果稳定
+    public static func subdirectories(of directory: URL) -> [URL] {
         guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: downloadDirectory,
+            at: directory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
-            return result
+            return []
         }
+        return contents
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
 
-        for item in contents {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDir),
-                  isDir.boolValue else {
-                continue
-            }
+    /// 目录中是否有 .ehviewer 文件（有则是画廊目录）
+    public static func exists(in directory: URL) -> Bool {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent(filename).path)
+    }
 
-            if let info = read(from: item) {
-                result.append((item, info))
-            }
+    /// 是否是分组目录：没有 .ehviewer，里面也没有页面图片
+    /// (只有图片的是缺了 .ehviewer 的画廊目录，不能当成分组)
+    public static func isGroupDirectory(_ directory: URL) -> Bool {
+        !exists(in: directory) && !containsPageImages(in: directory)
+    }
+
+    /// 目录里是否直接有 `%08d.ext` 格式的页面图片
+    private static func containsPageImages(in directory: URL) -> Bool {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return false }
+        return names.contains { name in
+            let chars = Array(name)
+            return chars.count > 9 && chars[8] == "." && chars[0..<8].allSatisfy { $0.isASCII && $0.isNumber }
         }
-
-        return result
     }
 
     // MARK: - 图片文件检测

@@ -550,6 +550,22 @@ public final class EhDatabase: Sendable {
         }
     }
 
+    public func getAllDownloadDirnames() throws -> [DownloadDirnameRecord] {
+        try dbQueue.read { db in
+            try DownloadDirnameRecord.fetchAll(db)
+        }
+    }
+
+    /// 用扫描结果整体替换目录名映射（同一事务内先清空再写入）
+    public func replaceDownloadDirnames(_ dirnames: [Int64: String]) throws {
+        try dbQueue.write { db in
+            _ = try DownloadDirnameRecord.deleteAll(db)
+            for (gid, dirname) in dirnames {
+                try DownloadDirnameRecord(gid: gid, dirname: dirname).insert(db)
+            }
+        }
+    }
+
     // MARK: - 画廊标签缓存操作
 
     public func getGalleryTags(gid: Int64) throws -> GalleryTagsRecord? {

@@ -700,7 +700,7 @@ struct SettingsView: View {
             }
             #endif
 
-            Stepper("并发线程: \(vm.multiThread)", value: $vm.multiThread, in: 1...5)
+            Stepper("下载线程数: \(vm.multiThread)", value: $vm.multiThread, in: 1...5)
 
             Stepper("超时 (秒): \(vm.downloadTimeout)", value: $vm.downloadTimeout, in: 10...120, step: 10)
 
@@ -927,7 +927,7 @@ struct SettingsView: View {
             .disabled(AppUpdateChecker.shared.isChecking)
 
             Button("源代码") {
-                openURL(URL(string: "https://github.com/felixchaos/EhViewer-Apple")!)
+                openURL(URL(string: "https://github.com/liuyiyanq/EhViewer-Apple")!)
             }
 
             NavigationLink("开源协议") {
@@ -1704,10 +1704,7 @@ class SettingsViewModel {
             var errorCount = 0
 
             let fm = FileManager.default
-            guard let contents = try? fm.contentsOfDirectory(
-                at: downloadDir, includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else {
+            guard (try? fm.contentsOfDirectory(atPath: downloadDir.path)) != nil else {
                 await MainActor.run {
                     self.restoreResultMessage = "无法读取下载目录"
                     self.isRestoring = false
@@ -1716,7 +1713,7 @@ class SettingsViewModel {
             }
 
             // 获取数据库中已有的 gid 集合
-            let existingGids: Set<Int64>
+            var existingGids: Set<Int64>
             do {
                 let records = try EhDatabase.shared.getAllDownloads()
                 existingGids = Set(records.map { $0.gid })
@@ -1728,23 +1725,17 @@ class SettingsViewModel {
                 return
             }
 
-            for dir in contents where dir.hasDirectoryPath {
-                let ehviewerFile = dir.appendingPathComponent(".ehviewer")
-                guard fm.fileExists(atPath: ehviewerFile.path) else { continue }
-
-                // 读取 SpiderInfo 以获取 gid/token/pages
-                // 只要头部字段 —— 这里会遍历整个下载目录，逐本解析上万条 pToken 纯属浪费
-                // (对齐上游 2026-08-21「添加读取画廊信息头的功能」)
-                guard let spiderInfo = SpiderInfoFile.readHeader(from: dir) else { continue }
+            // 扫描根目录和一层分组，只认含 .ehviewer 的目录，只读头部字段
+            for (dir, spiderInfo) in SpiderInfoFile.scanOfflineGalleries(in: downloadDir) {
                 guard spiderInfo.gid > 0, !spiderInfo.token.isEmpty else { continue }
 
                 // 跳过已在数据库中的
                 if existingGids.contains(spiderInfo.gid) { continue }
 
-                // 从目录名提取标题: 格式为 "gid-title"
-                let dirName = dir.lastPathComponent
-                let prefix = "\(spiderInfo.gid)-"
-                let title = dirName.hasPrefix(prefix) ? String(dirName.dropFirst(prefix.count)) : dirName
+                // 从目录名提取标题: 格式为 "[序号_]gid-title"
+                let title = DownloadDirectoryName.galleryTitle(
+                    fromDirectoryName: dir.lastPathComponent, gid: spiderInfo.gid
+                )
 
                 // 统计已下载页数
                 let imageFiles = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))
@@ -1764,6 +1755,7 @@ class SettingsViewModel {
 
                 do {
                     try EhDatabase.shared.insertDownload(record)
+                    existingGids.insert(spiderInfo.gid)
                     restoredCount += 1
                 } catch {
                     errorCount += 1
@@ -1792,10 +1784,7 @@ class SettingsViewModel {
             let downloadDir = DownloadManager.shared.downloadDirectory
             let fm = FileManager.default
 
-            guard let contents = try? fm.contentsOfDirectory(
-                at: downloadDir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
-                options: [.skipsHiddenFiles]
-            ) else {
+            guard (try? fm.contentsOfDirectory(atPath: downloadDir.path)) != nil else {
                 await MainActor.run {
                     self.cleanResultMessage = "无法读取下载目录"
                     self.isCleaning = false
@@ -1816,24 +1805,17 @@ class SettingsViewModel {
                 return
             }
 
-            // 找出孤立目录 (目录名以 gid- 开头，但 gid 不在数据库中)
-            var orphanDirs: [URL] = []
+            // 找出孤立目录：含 .ehviewer、但其中的 gid 不在数据库中的画廊目录
+            // 不看目录名 —— 用户自建的分组文件夹 (如 "2024-收藏") 不能被当成画廊删掉
+            let orphanDirs = Self.orphanGalleryDirectories(in: downloadDir, dbGids: dbGids)
             var totalSize: Int64 = 0
-            for dir in contents where dir.hasDirectoryPath {
-                let dirName = dir.lastPathComponent
-                // 尝试提取 gid (格式: "gid-title")
-                if let dashRange = dirName.firstIndex(of: "-"),
-                   let gid = Int64(dirName[dirName.startIndex..<dashRange]) {
-                    if !dbGids.contains(gid) {
-                        orphanDirs.append(dir)
-                        // 计算目录大小
-                        if let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) {
-                            let fileURLs = enumerator.allObjects.compactMap { $0 as? URL }
-                            for fileURL in fileURLs {
-                                let size = (try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize) ?? 0
-                                totalSize += Int64(size)
-                            }
-                        }
+            for dir in orphanDirs {
+                // 计算目录大小
+                if let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey]) {
+                    let fileURLs = enumerator.allObjects.compactMap { $0 as? URL }
+                    for fileURL in fileURLs {
+                        let size = (try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize) ?? 0
+                        totalSize += Int64(size)
                     }
                 }
             }
@@ -1863,10 +1845,7 @@ class SettingsViewModel {
             let downloadDir = DownloadManager.shared.downloadDirectory
             let fm = FileManager.default
 
-            guard let contents = try? fm.contentsOfDirectory(
-                at: downloadDir, includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else {
+            guard (try? fm.contentsOfDirectory(atPath: downloadDir.path)) != nil else {
                 await MainActor.run {
                     self.cleanResultMessage = "清除失败"
                     self.isCleaning = false
@@ -1887,14 +1866,9 @@ class SettingsViewModel {
             }
 
             var deletedCount = 0
-            for dir in contents where dir.hasDirectoryPath {
-                let dirName = dir.lastPathComponent
-                if let dashRange = dirName.firstIndex(of: "-"),
-                   let gid = Int64(dirName[dirName.startIndex..<dashRange]),
-                   !dbGids.contains(gid) {
-                    try? fm.removeItem(at: dir)
-                    deletedCount += 1
-                }
+            for dir in Self.orphanGalleryDirectories(in: downloadDir, dbGids: dbGids) {
+                try? fm.removeItem(at: dir)
+                deletedCount += 1
             }
 
             await MainActor.run {
@@ -1902,6 +1876,13 @@ class SettingsViewModel {
                 self.isCleaning = false
             }
         }
+    }
+
+    /// 不在数据库中的画廊目录（扫描根目录和一层分组，身份只认 .ehviewer 中的 gid）
+    nonisolated private static func orphanGalleryDirectories(in downloadDir: URL, dbGids: Set<Int64>) -> [URL] {
+        SpiderInfoFile.scanOfflineGalleries(in: downloadDir)
+            .filter { !dbGids.contains($0.1.gid) }
+            .map { $0.0 }
     }
 
     func cancelClean() {
