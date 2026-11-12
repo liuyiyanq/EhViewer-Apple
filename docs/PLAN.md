@@ -22,6 +22,8 @@
 | EH-4 | 下载列表分组与手动排序 | [下载列表分组与排序/TASK.md](下载列表分组与排序/TASK.md) | 3（实现要点 1、2）、6（实现要点 3–6） |
 | EH-5 | 画廊标题与评论复制、评论链接跳转、下载页封面跳转 | [画廊复制与跳转/TASK.md](画廊复制与跳转/TASK.md) | 7 |
 | EH-6 | 下载列表中的画廊，阅读时在线加载的页自动存入下载目录 | [阅读时补存下载页/TASK.md](阅读时补存下载页/TASK.md) | 3（第 3 项）、4（第 1、2 项） |
+| EH-7 | 下载页网格视图与拖动插入排序 | [下载页网格视图/TASK.md](下载页网格视图/TASK.md) | 真机反馈后追加，不占执行步骤 |
+| EH-8 | 只有图片的画廊目录被识别成分组，且无法解散 | [下载目录空分组/TASK.md](下载目录空分组/TASK.md) | 真机反馈后追加，不占执行步骤 |
 
 六张卡的"待你决定"目前都已清空，方案均已经用户确认。
 
@@ -83,7 +85,7 @@ macOS target 同样要编译通过（CONTRIBUTING.md 要求）。
 全局必须保持（各卡"必须保持"的公共部分）：
 
 - `.ehviewer` 文件格式不变，图片文件名格式 `%08d.ext` 不变
-- 全局图片请求并发上限 5；页面和接口请求全局不超过每秒 2 次
+- 全局图片请求并发上限 5；浏览的页面和接口请求全局不超过每秒 2 次，下载取页不占这个额度（EH-3 关键决策 9）
 - 旧格式 `gid-标题` 的下载目录无需改名或迁移即可识别
 - 数据库中 `download.label` 字段和 `downloadLabel` 表保留，不做删除型迁移
 
@@ -178,7 +180,7 @@ macOS target 同样要编译通过（CONTRIBUTING.md 要求）。
   5. 509：停止派发剩余页，整本置为失败并通知
   6. 后台：`ehviewer apple/BackgroundDownloadManager.swift` 中 BGProcessingTask 不再提前报告完成；回到前台调用 `kickQueue`
   7. `getPToken`：按详情页去重（EH-2）并使用解析出的每页缩略图数（EH-3 第 6 项）
-  8. EH-2 收尾：`SettingsView.swift` 中「并发线程」改名为「单本并发页数」并加说明；删除 `DownloadManager` 中未使用的 `maxConcurrent`
+  8. EH-2 收尾：`SettingsView.swift` 中「并发线程」改名为「单本并发页数」并加说明（11-11 真机反馈后改为「下载线程数」，不加说明）；删除 `DownloadManager` 中未使用的 `maxConcurrent`
 - 不做：画廊级并发（EH-2 关键决策 1）、失败日志
 - 完成标准：EH-2、EH-3 剩余验收项可交用户验证；限流器单元测试通过（受外部阻塞时注明）
 
@@ -235,7 +237,7 @@ mkdir -p build/Payload && cp -R build/EhViewer.xcarchive/Products/Applications/*
 
 版本号与发布：
 
-- 每次打包前更新 `MARKETING_VERSION`（主 App 和小组件保持一致）和 `CURRENT_PROJECT_VERSION`，具体数字待用户确定（建议从 1.3.2 起，纯数字）
+- 每次打包前更新 `MARKETING_VERSION`（主 App 和小组件保持一致）和 `CURRENT_PROJECT_VERSION`，本期定为 1.3.2（用户 11-12 确认），`CURRENT_PROJECT_VERSION` 保持 1
 - 在 fork 上创建 Release（tag 与版本号一致，附 IPA）后，已安装的 App 才能检查到更新。创建 tag、Release 和上传都要用户确认
 
 ## 任务卡更新规则
@@ -249,3 +251,53 @@ mkdir -p build/Payload && cp -R build/EhViewer.xcarchive/Products/Applications/*
 - 受 Xcode 缺失影响的验收项标为"阻塞"，并在卡片"外部阻塞"表登记
 
 全部步骤完成后，在本文件末尾追加一节"执行记录"，按步骤列出提交 SHA 和遗留事项。
+
+## 执行记录
+
+2026-11-11，第 0–7 步代码已全部写完，**均未提交**（工作区基于 `8858093`）。按用户要求过程中未做真机验收。
+
+| 步骤 | 内容 | 提交 | 本地检查 |
+| --- | --- | --- | --- |
+| 0 | 检查更新、「源代码」链接改为 `liuyiyanq/EhViewer-Apple` | 未提交 | App 类型检查通过 |
+| 1 | EH-1 A：本地页后台读盘解码（`ReaderViewModel.loadLocalImage`） | 未提交 | 同上 |
+| 2 | EH-3 #1、EH-1 C、C2：每轮运行编号 + 可同步取消的 `runTask`；SpiderQueen 保存下载 Task 句柄；SpiderDen 构造时定模式、目录由 DownloadManager 传入；按磁盘计数判定完成（`diskProgress`） | 未提交 | Packages 编译通过 |
+| 3 | EH-4 要点 1–2、EH-1 B、EH-6 #3：清除冗余和恢复只认 `.ehviewer` 并扫两层；`GalleryDirectoryIndex` 路径索引（`downloadDirname` 表缓存）；图片原子写入 | 未提交 | 同上 |
+| 4 | EH-6 #1–2：在下载列表中即启用本地目录，每页现查；在线页自动补存（开启下载原图时不存） | 未提交 | 同上 |
+| 5 | EH-3 #2–6、EH-2：限流器排队放行（浏览优先、可取消、下载冷却）；SpiderQueen 页面与接口走 EhAPI 下载档、图片走 `EhAPI.fetchDownloadImage`；换节点；"打开太快"冷却；509 停止派发；BGProcessingTask 等队列下完；回前台 `kickQueue`；`getPToken` 去重 + previewPerPage；设置改名；删 `maxConcurrent` | 未提交 | Packages 编译通过；限流器临时脚本验证通过 |
+| 6 | EH-4 要点 3–6：分组新建、改名、解散，移动，拖动排序与整层编号，延后改名（C5）；文件夹与画廊混排、叠放封面；下掉标签 | 未提交 | App 类型检查通过 |
+| 7 | EH-5：`EhURL.parseGalleryLink`；标题、评论长按复制；评论 HTML 转带链接文本，画廊链接 App 内打开；详情页头部用加载后信息；下载页点封面进详情 | 未提交 | App 类型检查通过；解析与渲染临时脚本验证通过 |
+
+本地检查方式（Xcode 安装前）：
+
+- Packages：在 `Packages/EhDownload` 下 `swift build`，覆盖 EhCore、EhNetwork、EhParser、EhSpider、EhDownload
+- App target：用 CLT 的 `swiftc -typecheck -swift-version 5 -default-isolation MainActor -target arm64-apple-macos26.0`，对去掉 `#Preview` 的 App 源码副本做 macOS 类型检查，0 错误、改动文件 0 告警。iOS 专属分支（`#if os(iOS)`）未被检查
+
+遗留事项：
+
+- 提交：待用户确认后提交。多步改动交织在同一文件（DownloadManager、SpiderQueen 等），按卡拆分提交不现实，建议按步骤或整体一次提交，提交信息列出涉及的卡号
+- 编译与测试：安装 Xcode 后编译 iOS、macOS target，在 `Packages/EhCore` 运行 `swift test`（新增 `EhModelsTests`、`EhSettingsTests`）
+- 各卡"关键决策"中标为"待确认"的项需要用户确认
+- 真机验收：见各卡验收表中"待人工验收"的行
+- 版本号已定为 1.3.2（主 App 与小组件的 `MARKETING_VERSION` 已改，README 版本徽章同步）；Release 待用户决定
+
+2026-11-11 补充（Xcode 26.5，位于 `~/Downloads/Xcode 2.app`，用 `DEVELOPER_DIR` 指定，不改 xcode-select）：
+
+- `Packages/EhCore` 下 `swift test`：7 项（EhURLTests 2、EhRateLimiterTests 5）全部通过
+- macOS target `xcodebuild build -destination platform=macOS CODE_SIGNING_ALLOWED=NO`：成功，改动文件无告警
+- iOS：Xcode 未安装 iOS 26.5 平台组件，`generic/platform=iOS Simulator` 和 `generic/platform=iOS` 都不可用，iOS 编译与打 IPA 暂时阻塞
+- 补充：安装 iOS 平台组件并重启 Mac（模拟器运行时重启后才挂载；Xcode 26 的资源目录编译即使打真机包也需要它）后，iOS 未签名 archive 成功，改动文件无告警
+- 已按"打包与升级安装"的命令打出 `build/EhViewer.ipa`（3.8 MB，`build/` 已被 git 忽略）。包内 bundle ID 为 `Stellatrix.ehviewer-apple`，小组件为 `Stellatrix.ehviewer-apple.EhDownloadWidget`，版本仍是 1.3.1（build 1），未改版本号
+
+2026-11-11 真机反馈后的修正（均未提交）：
+
+- 下载卡住、几分钟下不了一页：下载取页不再占每秒 2 次额度，去掉"打开太快"整体冷却，单页重试改回旧版节奏（5 次，0.5 秒起翻倍），见 EH-3 关键决策 9。限流器测试同步调整，`swift test` 6 项通过
+- 下载速度与页数：重新开始下载时磁盘上已有的页不再重复计数（曾出现 216/138），速度只算网络字节、按最近 5 秒计算；暂停时清零，只在下载中显示
+- 右滑删除确认框：从 NavigationStack 外层挪回当前层级，位置与旧版一致
+- 阅读器：已下载画廊的本地文件读不出时，失败页按钮显示"重新下载"，点击后删除坏文件、从网络重新加载并存回下载目录
+- 设置项文案改回「下载线程数」，去掉说明行；评论里 href 混有引号或尖括号的链接只把其中的网址标成链接
+- 下载页：未排序项排在已排序项之前，拖动排序后新下载不再沉底（EH-4 决策 14，取代决策 4）；状态筛选「下载中」「等待中」合并为「队列中」，等待中显示排队位置（EH-4 决策 15）。未编译
+- 下载页新增网格视图，格子可拖到另一格上松手插入、拖到文件夹上移入分组，见 EH-7
+- App 显示名称改为「EhViewer」（用户 11-12 确认大小写；Mac 菜单栏与 .app 文件名不改）：主 target 增加 `INFOPLIST_KEY_CFBundleDisplayName`，简体中文 `InfoPlist.strings` 同步；`PRODUCT_NAME`、bundle ID、scheme 不变
+- 2026-11-12 用户逐条确认待定决策：各卡"待你决定"已清空；EH-1 决策 3 作废（改为"重新下载"）；EH-4 决策 7 作废，新建分组不带序号、显示在最上面（决策 16）；批量栏按钮文案改为「移入分组」
+- 下载目录中只有图片、没有 .ehviewer 的画廊目录被当成空分组且无法解散，见 EH-8
+- 下载列表按标签搜索：只有打开过详情页的画廊才有标签数据。用户决定忽略（后续版本不再保留该功能），不做补齐
