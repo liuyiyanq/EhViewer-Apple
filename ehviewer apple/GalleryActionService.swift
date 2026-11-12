@@ -108,12 +108,16 @@ final class GalleryActionService {
 
     /// 复制画廊链接到剪贴板
     func copyLink(gid: Int64, token: String) {
-        let url = galleryURL(gid: gid, token: token)
+        copyText(galleryURL(gid: gid, token: token))
+    }
+
+    /// 复制文本到剪贴板
+    func copyText(_ text: String) {
         #if os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         #else
-        UIPasteboard.general.string = url
+        UIPasteboard.general.string = text
         #endif
     }
 

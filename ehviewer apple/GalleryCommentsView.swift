@@ -63,6 +63,8 @@ struct GalleryCommentsView: View {
                 }
             }
         }
+        // 评论里的画廊链接在 App 内打开
+        .openGalleryLinksInApp()
         .navigationTitle("评论 (\(vm.comments.count)\(vm.hasMore ? "+" : ""))")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -99,7 +101,8 @@ struct GalleryCommentsView: View {
     // MARK: - 单条评论
     
     private func commentRow(_ comment: GalleryComment) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let commentBody = CommentText.attributed(fromHTML: comment.comment)
+        return VStack(alignment: .leading, spacing: 8) {
             // 头部：用户名、时间、分数
             HStack {
                 Text(comment.user)
@@ -122,10 +125,17 @@ struct GalleryCommentsView: View {
                 }
             }
             
-            // 评论内容 (HTML 转纯文本，完整显示)
-            Text(comment.comment.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression))
+            // 评论内容 (保留换行和链接，完整显示)
+            Text(commentBody)
                 .font(.subheadline)
                 .foregroundStyle(.primary)
+                .contextMenu {
+                    Button {
+                        GalleryActionService.shared.copyText(String(commentBody.characters))
+                    } label: {
+                        Label("复制评论", systemImage: "doc.on.doc")
+                    }
+                }
             
             // 投票 / 编辑
             if comment.voteUpAble || comment.voteDownAble || comment.editable {

@@ -134,4 +134,41 @@ public enum EhURL {
     public static func tagDefinitionUrl(tag: String) -> String {
         "https://ehwiki.org/wiki/\(tag.replacingOccurrences(of: " ", with: "_"))"
     }
+
+    // MARK: 画廊链接解析
+
+    /// 画廊链接: e-hentai / exhentai，http / https，末尾带不带 `/`、带不带查询参数都可以
+    private static let galleryLinkPattern = try! NSRegularExpression(
+        pattern: #"https?://(?:www\.|lofi\.)?(?:e-hentai|exhentai)\.org/g/(\d+)/([0-9a-f]{10})(?![0-9a-f])"#,
+        options: [.caseInsensitive]
+    )
+
+    /// 从文本中找出第一个画廊链接；没有时返回 nil
+    public static func parseGalleryLink(_ text: String) -> GalleryLink? {
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = galleryLinkPattern.firstMatch(in: text, range: range),
+              let gidRange = Range(match.range(at: 1), in: text),
+              let tokenRange = Range(match.range(at: 2), in: text),
+              let gid = Int64(text[gidRange]), gid > 0 else { return nil }
+        return GalleryLink(gid: gid, token: String(text[tokenRange]).lowercased())
+    }
+
+    /// 解析画廊链接 URL；只认 e-hentai / exhentai 域名下的 `/g/` 路径，其他链接返回 nil
+    public static func parseGalleryLink(_ url: URL) -> GalleryLink? {
+        guard let host = url.host?.lowercased(),
+              host.hasSuffix("e-hentai.org") || host.hasSuffix("exhentai.org"),
+              url.absoluteString.lowercased().hasPrefix("http") else { return nil }
+        return parseGalleryLink(url.absoluteString)
+    }
+}
+
+/// 从链接中解析出的画廊身份
+public struct GalleryLink: Sendable, Hashable {
+    public let gid: Int64
+    public let token: String
+
+    public init(gid: Int64, token: String) {
+        self.gid = gid
+        self.token = token
+    }
 }

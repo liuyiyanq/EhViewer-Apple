@@ -7,8 +7,10 @@
 
 import SwiftUI
 import EhSettings
+import EhModels
 import EhAPI
 import EhCookie
+import EhDownload
 
 #if os(iOS)
 import UIKit
@@ -169,6 +171,8 @@ struct RootView: View {
             checkSecurityOnResume()
             // 检查剪贴板中的画廊链接 (对齐 Android MainActivity.onResume)
             checkClipboardForGalleryUrl()
+            // 后台时间用完时下载被挂起为等待状态，回到前台自动继续
+            Task { await DownloadManager.shared.kickQueue() }
         }
         #elseif os(macOS)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in
@@ -408,16 +412,8 @@ struct RootView: View {
         lastClipboardContent = content
 
         // 匹配 EH 画廊 URL: https://e-hentai.org/g/GID/TOKEN/
-        let pattern = #"https?://(e-hentai|exhentai)\.org/g/(\d+)/([0-9a-f]{10})"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)),
-              match.numberOfRanges >= 4,
-              let gidRange = Range(match.range(at: 2), in: content),
-              let tokenRange = Range(match.range(at: 3), in: content),
-              let gid = Int64(content[gidRange]) else { return }
-
-        let token = String(content[tokenRange])
-        clipboardGallery = (gid: gid, token: token)
+        guard let link = EhURL.parseGalleryLink(content) else { return }
+        clipboardGallery = (gid: link.gid, token: link.token)
         showClipboardAlert = true
     }
 }

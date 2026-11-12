@@ -85,6 +85,8 @@ struct GalleryDetailView: View {
                 }
             }
         }
+        // 评论里的画廊链接在 App 内打开
+        .openGalleryLinksInApp()
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(horizontalSizeClass == .compact ? .hidden : .automatic, for: .navigationBar)
@@ -142,7 +144,7 @@ struct GalleryDetailView: View {
         }
         #if os(macOS)
         .onReceive(NotificationCenter.default.publisher(for: .downloadGallery)) { _ in
-            Task { await vm.startDownload(gallery: gallery) }
+            Task { await vm.startDownload(gallery: displayGallery) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .favoriteGallery)) { _ in
             if vm.isFavorited {
@@ -173,7 +175,7 @@ struct GalleryDetailView: View {
         ) {
             Button("仍然下载") {
                 Haptics.impact()
-                Task { await vm.startDownload(gallery: gallery) }
+                Task { await vm.startDownload(gallery: displayGallery) }
             }
             Button("取消", role: .cancel) {}
         } message: {
@@ -194,7 +196,8 @@ struct GalleryDetailView: View {
     // MARK: - Header
 
     private var headerSection: some View {
-        HStack(alignment: .top, spacing: 14) {
+        let gallery = displayGallery
+        return HStack(alignment: .top, spacing: 14) {
             // 封面
             CachedAsyncImage(url: URL(string: gallery.thumb ?? "")) { img in
                 img.resizable().aspectRatio(contentMode: .fill)
@@ -209,6 +212,7 @@ struct GalleryDetailView: View {
                 Text(gallery.suitableTitle(preferJpn: AppSettings.shared.showJpnTitle))
                     .font(.headline)
                     .lineLimit(4)
+                    .contextMenu { titleCopyMenu(gallery) }
 
                 if let uploader = gallery.uploader {
                     Text(uploader)
@@ -261,6 +265,36 @@ struct GalleryDetailView: View {
             }
         }
         .padding()
+    }
+
+    /// 头部显示的画廊信息：优先用加载后的详情 —— 从评论链接、剪贴板打开时传入的只有 gid 和 token
+    private var displayGallery: GalleryInfo {
+        if let info = vm.detail?.info, !info.bestTitle.isEmpty {
+            return info
+        }
+        return gallery
+    }
+
+    /// 标题长按菜单：整段复制
+    @ViewBuilder
+    private func titleCopyMenu(_ gallery: GalleryInfo) -> some View {
+        Button {
+            GalleryActionService.shared.copyText(gallery.title ?? gallery.bestTitle)
+        } label: {
+            Label("复制标题", systemImage: "doc.on.doc")
+        }
+        if let titleJpn = gallery.titleJpn, !titleJpn.isEmpty {
+            Button {
+                GalleryActionService.shared.copyText(titleJpn)
+            } label: {
+                Label("复制日文标题", systemImage: "doc.on.doc")
+            }
+        }
+        Button {
+            GalleryActionService.shared.copyLink(gid: gallery.gid, token: gallery.token)
+        } label: {
+            Label("复制画廊链接", systemImage: "link")
+        }
     }
 
     /// 详情页封面尺寸 (对齐 Android Settings.KEY_DETAIL_SIZE)
@@ -339,7 +373,7 @@ struct GalleryDetailView: View {
                 } else {
                     let defaultSlot = AppSettings.shared.defaultFavSlot
                     if defaultSlot == -1 {
-                        vm.addLocalFavorite(gallery: gallery)
+                        vm.addLocalFavorite(gallery: displayGallery)
                     } else if defaultSlot >= 0 && defaultSlot <= 9 {
                         Task { await vm.addFavorite(gid: gallery.gid, token: gallery.token, slot: defaultSlot) }
                     } else {
@@ -369,7 +403,7 @@ struct GalleryDetailView: View {
                     showCellularWarning = true
                 } else {
                     Haptics.impact()
-                    Task { await vm.startDownload(gallery: gallery) }
+                    Task { await vm.startDownload(gallery: displayGallery) }
                 }
             }
             Divider().frame(height: 32)
@@ -402,7 +436,7 @@ struct GalleryDetailView: View {
                     showFavoritePicker = false
                     if slot == -1 {
                         // 本地收藏 (对齐 Android FAV_CAT_LOCAL)
-                        vm.addLocalFavorite(gallery: gallery)
+                        vm.addLocalFavorite(gallery: displayGallery)
                     } else {
                         Task { await vm.addFavorite(gid: gallery.gid, token: gallery.token, slot: slot) }
                     }
@@ -681,14 +715,22 @@ struct GalleryDetailView: View {
                                     .foregroundStyle(comment.score > 0 ? .green : .red)
                             }
                         }
-                        // Perf P0-4: 使用预处理的纯文本，避免 body 内正则计算
-                        Text(comment.strippedBody)
+                        // Perf P0-4: 使用预处理的结果，避免 body 内正则计算
+                        Text(comment.body)
                             .font(.subheadline)
                             .foregroundStyle(.primary)
                             .lineLimit(5) // Android: setMaxLines(5)
                     }
                     .padding(.horizontal)
                     .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Button {
+                            GalleryActionService.shared.copyText(comment.plainText)
+                        } label: {
+                            Label("复制评论", systemImage: "doc.on.doc")
+                        }
+                    }
                 }
             }
         }
@@ -763,21 +805,10 @@ class GalleryDetailViewModel {
         let user: String
         let time: Date
         let score: Int
-        let strippedBody: String  // HTML 已剥离的纯文本
-    }
-
-    /// 预编译正则 (避免每次调用都重新编译)
-    private static let htmlTagRegex: NSRegularExpression? = {
-        try? NSRegularExpression(pattern: "<[^>]+>", options: [])
-    }()
-
-    /// 从 HTML 中剥离标签 — 使用预编译正则
-    private static func stripHTML(_ html: String) -> String {
-        guard let regex = htmlTagRegex else {
-            return html.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-        }
-        let range = NSRange(html.startIndex..., in: html)
-        return regex.stringByReplacingMatches(in: html, options: [], range: range, withTemplate: "")
+        /// 评论正文：保留换行和链接
+        let body: AttributedString
+        /// 复制用的纯文本
+        var plainText: String { String(body.characters) }
     }
 
     // 从 GalleryDetail 导出的便捷属性
@@ -912,7 +943,7 @@ class GalleryDetailViewModel {
 
     // MARK: - Perf P0-4: 预处理评论 HTML
 
-    /// 在 loadDetail 成功后调用 — 后台剥离 HTML 标签，View body 直接读取纯文本
+    /// 在 loadDetail 成功后调用 — 评论 HTML 转成带链接的文本，View body 直接读取
     func preprocessComments(_ rawComments: [GalleryComment]) {
         processedComments = rawComments.map { comment in
             ProcessedComment(
@@ -920,7 +951,7 @@ class GalleryDetailViewModel {
                 user: comment.user,
                 time: comment.time,
                 score: comment.score,
-                strippedBody: Self.stripHTML(comment.comment)
+                body: CommentText.attributed(fromHTML: comment.comment)
             )
         }
     }
