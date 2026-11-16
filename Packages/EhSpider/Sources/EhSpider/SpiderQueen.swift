@@ -34,13 +34,11 @@ public actor SpiderQueen {
     private var downloadTask: Task<Void, Never>?
     /// 进行中的详情页请求 (按详情页号)，同一个详情页只请求一次
     private var detailPageLoads: [Int: Task<Void, Error>] = [:]
-    /// 图片配额已用完 (509)：剩余页不再派发
-    public private(set) var isImageLimitReached = false
+    /// 整本停止下载的原因 (509、IP 封禁、画廊已删除等)：设上后剩余页不再派发
+    public private(set) var stopReason: SpiderStopReason?
 
     /// 单页最多尝试次数 (对齐 Android SpiderWorker 最多 5 次)：用完即判失败，让出线程给后面的页
     private static let maxPageAttempts = 5
-    /// 同一页最多换几个 H@H 节点 (与阅读器一致)
-    private static let maxSkipHathKeys = 3
 
     private static let pTokenPattern = try! NSRegularExpression(pattern: #"/s/([0-9a-f]+)/\d+-(\d+)"#)
 
@@ -49,14 +47,12 @@ public actor SpiderQueen {
         AppSettings.shared.multiThreadDownload
     }
 
-    /// 下载图片 — 全局最多 5 个并发图片请求 (V-09)；超时读设置值；
+    /// 下载图片 — 占全局图片槽位 (V-09)；不限单张总时长；
     /// 走 EhAPI 获得域名前置回退。页面和接口请求另走 EhAPI 的下载档限速
     private func fetchImage(url: URL) async throws -> (Data, HTTPURLResponse) {
         try await EhRateLimiter.shared.acquireImageSlot()
         do {
-            let result = try await EhAPI.shared.fetchDownloadImage(
-                url: url, timeout: TimeInterval(AppSettings.shared.downloadTimeout)
-            )
+            let result = try await EhAPI.shared.fetchDownloadImage(url: url)
             await EhRateLimiter.shared.releaseImageSlot()
             return result
         } catch {
@@ -155,7 +151,7 @@ public actor SpiderQueen {
             var index = 0
 
             while index < pagesToDownload.count {
-                if Task.isCancelled || isImageLimitReached { break }
+                if Task.isCancelled || stopReason != nil { break }
                 if inFlight < maxConcurrent {
                     let pageIndex = pagesToDownload[index]
                     pageStates[pageIndex] = Self.stateLoading
@@ -228,18 +224,19 @@ public actor SpiderQueen {
 
     /// 加载单页图片 (对齐 Android SpiderWorker.downloadImage)
     /// 管线: 检查缓存 → 获取 pToken → 构建页面 URL → 获取图片 URL → 下载图片 → 存储
-    /// 图片下载失败时带 nl= 重新取页面换 H@H 节点；E-H 提示请求过快时等冷却后重试，不计入失败
+    /// 图片下载失败：先用同一地址重试 1 次 (不经过主站，不扣配额)；再失败不带 nl= 重新向主站要 1 次地址
+    /// (按普通看图扣 1 次，主站可能分到别的节点)；仍失败判本页失败。重试之间不等待
+    /// 不用 nl= 换节点：官方规则里强制重载失败的图算 50 次配额
     private func loadPage(index: Int) async {
         var lastError: Error?
         var attempt = 0
-        /// 最近一次页面返回的 nl key (对齐 Android skipHathKey)
-        var skipHathKey: String?
-        var usedSkipHathKeys: Set<String> = []
-        /// 下一次取页面时要带上的 nl key
-        var nextSkipHathKey: String?
+        /// 当前要下载的图片地址；为 nil 时向主站重新取
+        var imageUrl: String?
+        var retriedSameUrl = false
+        var refetchedUrl = false
 
-        while attempt < Self.maxPageAttempts {
-            if Task.isCancelled || isImageLimitReached {
+        attemptLoop: while attempt < Self.maxPageAttempts {
+            if Task.isCancelled || stopReason != nil {
                 markCancelled(index)
                 return
             }
@@ -256,39 +253,45 @@ public actor SpiderQueen {
                     return
                 }
 
-                // 1. 获取 pToken
-                let pToken = try await getPToken(for: index)
-
-                // 2. 获取图片 URL (换节点时必须走页面 HTML，showpage 接口不接受 nl)
-                let result: GalleryPageResult
-                if let currentShowKey = showKey, nextSkipHathKey == nil {
-                    result = try await fetchPageApi(index: index, pToken: pToken, showKey: currentShowKey)
-                } else {
-                    result = try await fetchPageHtml(index: index, pToken: pToken, skipHathKey: nextSkipHathKey)
-                }
-                nextSkipHathKey = nil
-                if let newShowKey = result.showKey {
-                    showKey = newShowKey
-                }
-                skipHathKey = result.skipHathKey
-
-                // 2.5 如果用户启用了"下载原始图片"且有原图 URL，优先使用 (对齐 Android downloadOriginImage)
                 let finalImageUrl: String
-                if AppSettings.shared.downloadOriginImage,
-                   let origin = result.originImageUrl, !origin.isEmpty {
-                    finalImageUrl = origin
+                if let current = imageUrl {
+                    // 同一地址重试，不再请求主站
+                    finalImageUrl = current
                 } else {
-                    finalImageUrl = result.imageUrl
-                }
+                    // 1. 获取 pToken
+                    let pToken = try await getPToken(for: index)
 
-                // 3. URL 有效性
-                guard !finalImageUrl.isEmpty else {
-                    throw SpiderError.emptyImageUrl
-                }
+                    // 2. 获取图片 URL
+                    let result: GalleryPageResult
+                    if let currentShowKey = showKey {
+                        result = try await fetchPageApi(index: index, pToken: pToken, showKey: currentShowKey)
+                    } else {
+                        result = try await fetchPageHtml(index: index, pToken: pToken)
+                    }
+                    if let newShowKey = result.showKey {
+                        showKey = newShowKey
+                    }
 
-                // 4. 509 检测
-                if finalImageUrl.contains("509.gif") || finalImageUrl.contains("509s.gif") {
-                    throw SpiderError.imageLimitReached
+                    // 2.5 如果用户启用了"下载原始图片"且有原图 URL，优先使用 (对齐 Android downloadOriginImage)
+                    let resolved: String
+                    if AppSettings.shared.downloadOriginImage,
+                       let origin = result.originImageUrl, !origin.isEmpty {
+                        resolved = origin
+                    } else {
+                        resolved = result.imageUrl
+                    }
+
+                    // 3. URL 有效性
+                    guard !resolved.isEmpty else {
+                        throw SpiderError.emptyImageUrl
+                    }
+
+                    // 4. 509 检测
+                    if resolved.contains("509.gif") || resolved.contains("509s.gif") {
+                        throw SpiderError.imageLimitReached
+                    }
+                    imageUrl = resolved
+                    finalImageUrl = resolved
                 }
 
                 // 5. 下载图片并存储
@@ -300,36 +303,39 @@ public actor SpiderQueen {
                 pageStates[index] = Self.stateFinish
                 await delegate?.onPageLoaded(index: index, imageUrl: finalImageUrl, networkBytes: networkBytes)
                 activeTasks.removeValue(forKey: index)
+                await waitDownloadDelay(networkBytes: networkBytes)
                 return
 
             } catch is CancellationError {
                 markCancelled(index)
-                return
-            } catch SpiderError.imageLimitReached {
-                await handleImageLimitReached(index)
                 return
             } catch {
                 if Task.isCancelled {
                     markCancelled(index)
                     return
                 }
+                // 账号级、画廊级错误重试也没用：整本停下，原因交给 DownloadManager 处理
+                if let reason = SpiderStopReason(error: error) {
+                    await stopDownload(index, reason: reason, error: error)
+                    return
+                }
                 lastError = error
-                // 图片下载失败多半是 H@H 节点不可用，带 nl= 重新取页面换一个节点；
-                // 服务器重复返回同一个 key 说明没有别的节点了 (对齐 Android leakSkipHathKey)
-                if downloadingImage, let key = skipHathKey, !key.isEmpty,
-                   !usedSkipHathKeys.contains(key), usedSkipHathKeys.count < Self.maxSkipHathKeys {
-                    usedSkipHathKeys.insert(key)
-                    nextSkipHathKey = key
-                }
-                // showKey 可能过期，清除后下次使用 HTML 方式
-                if attempt > 0 { showKey = nil }
                 attempt += 1
-                // 下载延迟 (downloadDelay, 毫秒) 为基础的指数退避：默认 0.5、1、2、4 秒
-                if attempt < Self.maxPageAttempts {
-                    let userDelay = Double(max(500, AppSettings.shared.downloadDelay))
-                    let delayMs = userDelay * pow(2.0, Double(attempt - 1))
-                    try? await Task.sleep(for: .milliseconds(Int(delayMs)))
+                guard downloadingImage else {
+                    // 向主站取地址失败：showKey 可能过期，第二次起清除，下次改用 HTML 方式
+                    if attempt > 1 { showKey = nil }
+                    continue
                 }
+                if !retriedSameUrl {
+                    retriedSameUrl = true
+                    continue
+                }
+                // 同一地址仍失败，多半是 H@H 节点不可用：重新向主站要一次地址，只要一次
+                // 写盘失败与节点无关，重新要地址只会白扣配额
+                let isStorageError = error as? SpiderError == .diskFull || error as? SpiderError == .storageFailed
+                guard !isStorageError, !refetchedUrl else { break attemptLoop }
+                refetchedUrl = true
+                imageUrl = nil
             }
         }
 
@@ -339,14 +345,23 @@ public actor SpiderQueen {
         activeTasks.removeValue(forKey: index)
     }
 
-    /// 图片配额用完：剩余页也拿不到，停止派发并通知，整本由 DownloadManager 按磁盘判为失败
-    private func handleImageLimitReached(_ index: Int) async {
+    /// 整本停止：剩余页也拿不到，停止派发并通知，整本由 DownloadManager 按磁盘判为失败
+    private func stopDownload(_ index: Int, reason: SpiderStopReason, error: Error) async {
         pageStates[index] = Self.stateFailed
         activeTasks.removeValue(forKey: index)
-        guard !isImageLimitReached else { return }
-        isImageLimitReached = true
-        await delegate?.onImageLimitReached()
+        guard stopReason == nil else { return }
+        stopReason = reason
+        if SpiderStopReason.isImageLimit(error) {
+            await delegate?.onImageLimitReached()
+        }
         downloadTask?.cancel()
+    }
+
+    /// 下载模式下每页从网络下完后等待「下载延迟」，期间占着这个线程 (对齐 Android SpiderWorker 的 Thread.sleep(mDownloadDelay))
+    private func waitDownloadDelay(networkBytes: Int64) async {
+        let delay = AppSettings.shared.downloadDelay
+        guard mode == .download, networkBytes > 0, delay > 0 else { return }
+        try? await Task.sleep(for: .milliseconds(delay))
     }
 
     /// 取消后该页回到未加载状态，不计入失败
@@ -491,12 +506,9 @@ public actor SpiderQueen {
 
     // MARK: - 网络请求 (走 EhAPI 下载档：限速、域名前置回退、Cookie 清洁)
 
-    /// 通过 GET 获取页面 HTML (首次获取 showKey，或带 nl= 换 H@H 节点)
-    private func fetchPageHtml(index: Int, pToken: String, skipHathKey: String?) async throws -> GalleryPageResult {
-        var url = EhURL.pageUrl(gid: galleryInfo.gid, index: index, pToken: pToken, site: AppSettings.shared.gallerySite)
-        if let key = skipHathKey, !key.isEmpty {
-            url += (url.contains("?") ? "&" : "?") + "nl=\(key)"
-        }
+    /// 通过 GET 获取页面 HTML (首次获取 showKey，或 showKey 失效后)
+    private func fetchPageHtml(index: Int, pToken: String) async throws -> GalleryPageResult {
+        let url = EhURL.pageUrl(gid: galleryInfo.gid, index: index, pToken: pToken, site: AppSettings.shared.gallerySite)
         return try await EhAPI.shared.getGalleryPage(url: url, priority: .download)
     }
 
@@ -522,6 +534,86 @@ public protocol SpiderDelegate: AnyObject, Sendable {
     func onImageLimitReached() async
     func onDownloadProgress(downloaded: Int, total: Int) async
     func onDiskFull() async
+}
+
+// MARK: - 失败原因
+
+/// 整本停止下载的原因
+public enum SpiderStopReason: Sendable, Equatable {
+    /// 账号或 IP 层面 (509、IP 封禁、请求过快、登录失效)：后面的画廊也会失败，应暂停整个队列
+    case account(String)
+    /// 这本画廊本身不可用 (已删除、不可用)：重试也没用，下一本照常下载
+    case gallery(String)
+
+    /// 不属于这两类的错误返回 nil，按普通失败重试
+    public init?(error: Error) {
+        if Self.isImageLimit(error) {
+            self = .account(SpiderQueen.failureMessage(for: error))
+            return
+        }
+        guard let ehError = error as? EhError else { return nil }
+        switch ehError {
+        case .ipBanned, .openingPagesTooFast, .sadPanda, .kokomade, .igneousWrong, .cloudflare403:
+            self = .account(SpiderQueen.failureMessage(for: error))
+        case .pining, .galleryUnavailable, .offensive:
+            self = .gallery(SpiderQueen.failureMessage(for: error))
+        default:
+            return nil
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .account(let message), .gallery(let message): return message
+        }
+    }
+
+    static func isImageLimit(_ error: Error) -> Bool {
+        if error as? SpiderError == .imageLimitReached { return true }
+        if let ehError = error as? EhError, case .imageLimitReached = ehError { return true }
+        return false
+    }
+}
+
+extension SpiderQueen {
+    /// 下载页显示用的简短失败原因
+    public static func failureMessage(for error: Error) -> String {
+        if SpiderStopReason.isImageLimit(error) { return "509 配额已用完" }
+        if let ehError = error as? EhError {
+            switch ehError {
+            case .ipBanned(let detail): return detail.isEmpty ? "IP 被临时封禁" : "IP 被临时封禁（\(detail)）"
+            case .openingPagesTooFast: return "请求过快"
+            case .sadPanda, .kokomade, .igneousWrong: return "登录失效或无里站权限"
+            case .cloudflare403: return "Cloudflare 验证拦截"
+            case .pining: return "画廊已删除"
+            case .galleryUnavailable: return "画廊不可用"
+            case .offensive: return "画廊有内容警告"
+            case .httpError(let code, _): return "HTTP \(code)"
+            case .parseError: return "页面解析失败"
+            case .serverError(let message): return message
+            default: return "网络错误"
+            }
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut: return "超时"
+            case .notConnectedToInternet: return "无网络"
+            case .networkConnectionLost: return "连接中断"
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed: return "连不上服务器"
+            default: return "网络错误"
+            }
+        }
+        if let spiderError = error as? SpiderError {
+            switch spiderError {
+            case .pTokenNotFound: return "找不到页面链接"
+            case .networkError: return "图片下载失败"
+            case .storageFailed: return "保存失败"
+            case .diskFull: return "存储空间不足"
+            default: return "图片地址无效"
+            }
+        }
+        return "未知错误"
+    }
 }
 
 // MARK: - 错误

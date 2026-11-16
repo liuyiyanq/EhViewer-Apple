@@ -700,11 +700,10 @@ struct SettingsView: View {
             }
             #endif
 
-            Stepper("下载线程数: \(vm.multiThread)", value: $vm.multiThread, in: 1...5)
+            // 上限对齐 Android 的 1/3/5/7
+            Stepper("下载线程数: \(vm.multiThread)", value: $vm.multiThread, in: 1...7)
 
-            Stepper("超时 (秒): \(vm.downloadTimeout)", value: $vm.downloadTimeout, in: 10...120, step: 10)
-
-            // 下载延迟 (对齐 Android Settings.KEY_DOWNLOAD_DELAY)
+            // 每页下完后等待 (对齐 Android Settings.KEY_DOWNLOAD_DELAY)
             Stepper("下载延迟: \(vm.downloadDelay) ms", value: $vm.downloadDelay, in: 0...2000, step: 100)
 
             // 图片分辨率 —— 走 uconfig Cookie (xr)，改完立即同步
@@ -1430,9 +1429,6 @@ class SettingsViewModel {
     var multiThread: Int = 3 {
         didSet { AppSettings.shared.multiThreadDownload = multiThread }
     }
-    var downloadTimeout: Int = 60 {
-        didSet { AppSettings.shared.downloadTimeout = downloadTimeout }
-    }
     var downloadDelay: Int = 0 {
         didSet { AppSettings.shared.downloadDelay = downloadDelay }
     }
@@ -1506,7 +1502,6 @@ class SettingsViewModel {
         preloadImage = AppSettings.shared.preloadImage
         keepScreenOn = AppSettings.shared.keepScreenOn
         multiThread = AppSettings.shared.multiThreadDownload
-        downloadTimeout = AppSettings.shared.downloadTimeout
         downloadDelay = AppSettings.shared.downloadDelay
         autoPageInterval = AppSettings.shared.autoPageInterval
         historyInfoSize = AppSettings.shared.historyInfoSize
@@ -1905,7 +1900,7 @@ class SettingsViewModel {
         let defaults = UserDefaults.standard
         let allKeys = [
             "gallery_site", "domain_fronting", "dns_over_https", "built_in_hosts",
-            "multi_thread_download", "preload_image", "download_delay", "download_timeout",
+            "multi_thread_download", "preload_image", "download_delay",
             "download_origin_image", "image_resolution", "read_cache_size", "list_mode",
             "show_jpn_title", "show_tag_translations", "show_gallery_comment", "show_gallery_rating",
             "show_read_progress", "wide_screen_list_mode", "show_eh_events", "show_eh_limits",
@@ -1990,7 +1985,6 @@ class SettingsViewModel {
         preloadImage = AppSettings.shared.preloadImage
         keepScreenOn = AppSettings.shared.keepScreenOn
         multiThread = AppSettings.shared.multiThreadDownload
-        downloadTimeout = AppSettings.shared.downloadTimeout
         downloadDelay = AppSettings.shared.downloadDelay
         autoPageInterval = AppSettings.shared.autoPageInterval
         historyInfoSize = AppSettings.shared.historyInfoSize

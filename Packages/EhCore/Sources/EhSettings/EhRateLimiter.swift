@@ -5,7 +5,7 @@
 //  全局速率限制器 — 防止 IP 封禁 (V-08, V-09)
 //  浏览页面/接口请求: 排队放行，2 次/秒，burst 3
 //  下载取页请求: 不占限速，并发由下载线程数控制
-//  图片下载: 全局最多 5 并发
+//  图片下载: 全局最多 10 并发 (实际由下载线程数决定)
 //
 
 import Foundation
@@ -13,7 +13,7 @@ import Foundation
 /// 全局速率限制器 — 所有网络请求共享同一实例
 /// - 页面/接口请求 (EhAPI): `try await waitApiSlot(priority:)`
 ///   浏览请求进入队列，每产生一个 token 只放行一个；排队中的任务被取消时从队列移除，不再发出请求
-/// - 图片下载 (SpiderQueen): `try await acquireImageSlot()` / `releaseImageSlot()` → 全局最多 5 并发
+/// - 图片下载 (SpiderQueen): `try await acquireImageSlot()` / `releaseImageSlot()` → 全局最多 10 并发
 public actor EhRateLimiter {
     public static let shared = EhRateLimiter()
 
@@ -50,7 +50,8 @@ public actor EhRateLimiter {
 
     // MARK: - Semaphore (Image Downloads)
 
-    /// 全局最大并发图片下载数
+    /// 全局最大并发图片下载数 — 取下载线程数的上限 (AppSettings 夹在 1–10)，
+    /// 同一时间只下一本，实际并发跟随线程数 (对齐 Android：图片请求不另设上限)
     private let maxImageConcurrent: Int
     /// 当前活跃下载数
     private var activeImageCount = 0
@@ -63,7 +64,7 @@ public actor EhRateLimiter {
     /// 等待队列 — FIFO
     private var imageWaiters: [ImageWaiter] = []
 
-    init(apiRefillRate: Double = 2.0, apiBurstCapacity: Double = 3.0, maxImageConcurrent: Int = 5) {
+    init(apiRefillRate: Double = 2.0, apiBurstCapacity: Double = 3.0, maxImageConcurrent: Int = 10) {
         self.apiRefillRate = apiRefillRate
         self.apiBurstCapacity = apiBurstCapacity
         self.apiTokens = apiBurstCapacity

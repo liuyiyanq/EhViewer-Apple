@@ -45,6 +45,8 @@ public actor DownloadManager {
     /// 整层重新编号时正在下载的画廊延后改名：gid → 目标相对路径，下载停止后执行
     private var pendingRenames: [Int64: String] = [:]
     private var isRunning = false
+    /// 账号级错误 (509、IP 封禁等) 让队列整体暂停时的原因；恢复或新增下载时清除
+    public private(set) var haltReason: String?
 
     /// 下载监听器（用于通知集成）
     public weak var listener: DownloadListener?
@@ -114,6 +116,7 @@ public actor DownloadManager {
 
     /// 添加下载任务 (Fix A-1: 已有 failed/none 状态时自动恢复而非静默忽略)
     public func startDownload(gallery: GalleryInfo) async {
+        haltReason = nil
         // 检查是否已在队列中
         if let existingIndex = downloadQueue.firstIndex(where: { $0.gallery.gid == gallery.gid }) {
             let existingState = downloadQueue[existingIndex].state
@@ -182,6 +185,7 @@ public actor DownloadManager {
 
     /// 恢复下载
     public func resumeDownload(gid: Int64) {
+        haltReason = nil
         if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
             downloadQueue[index].state = Self.stateWait
             try? EhDatabase.shared.updateDownloadState(gid: gid, state: Self.stateWait)
@@ -267,7 +271,9 @@ public actor DownloadManager {
 
     /// 更新下载速度 (由 SpiderInfoUpdater 调用，同步到队列以便 UI 读取)
     public func updateDownloadSpeed(gid: Int64, speed: Int64) {
-        if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
+        // 一轮结束后可能还有迟到的回调，不能把速度写到已不在下载的画廊上
+        if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }),
+           downloadQueue[index].state == Self.stateDownload {
             downloadQueue[index].speed = speed
         }
     }
@@ -318,6 +324,7 @@ public actor DownloadManager {
 
         isRunning = true
         downloadQueue[nextIndex].state = Self.stateDownload
+        downloadQueue[nextIndex].failureReason = nil
         activeTask = downloadQueue[nextIndex]
 
         // ★ 只向下传递 gid，绝不传递数组索引:
@@ -459,6 +466,7 @@ public actor DownloadManager {
         await spider.startDownload()
 
         let finalInfo = await spider.getSpiderInfo()
+        let stopReason = await spider.stopReason
 
         // ★ 长时间 await 之后任务可能已被删除或暂停 —— 此时不得再写回状态或文件，
         //   否则会数组越界崩溃 (旧索引失效)、把状态写到别的画廊头上，或重建已删除的目录
@@ -476,7 +484,13 @@ public actor DownloadManager {
         let progress = diskProgress(dir: dir, pages: gallery.pages)
         let success = progress.complete
         downloadQueue[finalIndex].state = success ? Self.stateFinish : Self.stateFailed
+        if success {
+            downloadQueue[finalIndex].failureReason = nil
+        } else if let stopReason {
+            downloadQueue[finalIndex].failureReason = stopReason.message
+        }
         downloadQueue[finalIndex].downloadedPages = progress.downloaded
+        downloadQueue[finalIndex].speed = 0
         downloadQueue[finalIndex].spider = nil  // 释放 spider 引用
         try? EhDatabase.shared.updateDownloadState(gid: gallery.gid, state: downloadQueue[finalIndex].state)
 
@@ -486,7 +500,28 @@ public actor DownloadManager {
         // iOS: 释放后台执行时间
         await endBackgroundTask(bgToken)
 
+        // 账号级错误时后面的画廊也会失败，暂停整个队列，等用户确认后再继续
+        if case .account(let message)? = stopReason, currentRunID == runID {
+            haltQueue(reason: message)
+        }
+
         finishRunning(runID: runID)
+    }
+
+    /// 暂停所有等待中的画廊，不再一本接一本地失败、继续请求主站
+    private func haltQueue(reason: String) {
+        haltReason = reason
+        for i in downloadQueue.indices where downloadQueue[i].state == Self.stateWait {
+            downloadQueue[i].state = Self.stateNone
+            try? EhDatabase.shared.updateDownloadState(gid: downloadQueue[i].gallery.gid, state: Self.stateNone)
+        }
+    }
+
+    /// 记录本轮最近一次失败原因 (由 SpiderInfoUpdater 调用)，画廊下载失败时显示
+    func recordFailure(gid: Int64, reason: String) {
+        if let index = downloadQueue.firstIndex(where: { $0.gallery.gid == gid }) {
+            downloadQueue[index].failureReason = reason
+        }
     }
 
     // MARK: - 文件管理
@@ -994,6 +1029,8 @@ public struct DownloadTask: Sendable {
     public var spider: SpiderQueen?
     /// 加入下载的时间 (未排序的项按它倒序显示)
     public let date: Date
+    /// 最近一次失败的原因，只在本次运行内保留；状态为失败时显示
+    public var failureReason: String?
 
     public init(gallery: GalleryInfo, state: Int = DownloadManager.stateWait, date: Date = Date()) {
         self.gallery = gallery
@@ -1075,6 +1112,7 @@ actor SpiderInfoUpdater: SpiderDelegate {
 
     func onPageFailed(index: Int, error: Error) async {
         print("[SpiderInfoUpdater] Page \(index) failed: \(error)")
+        await DownloadManager.shared.recordFailure(gid: gid, reason: SpiderQueen.failureMessage(for: error))
     }
 
     func onImageLimitReached() async {

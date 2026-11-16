@@ -94,8 +94,8 @@ public actor EhAPI {
             delegateQueue: nil
         )
 
+        // 不限单张总时长 (慢节点也能下完)；完全卡住由请求的 10 秒数据间隔兜底
         let downloadImgConfig = URLSessionConfiguration.default
-        downloadImgConfig.timeoutIntervalForResource = 300
         downloadImgConfig.httpCookieStorage = .shared
         downloadImgConfig.urlCache = nil
         downloadImgConfig.allowsCellularAccess = true
@@ -901,11 +901,14 @@ public actor EhAPI {
         return data
     }
 
+    /// 下载图片时两次收到数据的最长间隔 (对齐 Android OkHttp readTimeout 10 秒)：慢节点尽快放弃
+    private static let downloadImageIdleTimeout: TimeInterval = 10
+
     /// 下载器的图片请求 — 连接类失败 (DNS 污染、TLS 被拦等) 时回退域名前置直连，与阅读器一致
-    /// 不占页面/接口限速，并发由调用方的图片槽位控制
-    public func fetchDownloadImage(url: URL, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
+    /// 不占页面/接口限速，并发由调用方的图片槽位控制；不限总时长，网速慢的图也能下完
+    public func fetchDownloadImage(url: URL) async throws -> (Data, HTTPURLResponse) {
         var request = URLRequest(url: url)
-        request.timeoutInterval = timeout
+        request.timeoutInterval = Self.downloadImageIdleTimeout
         let result: (Data, URLResponse)
         do {
             result = try await downloadImageSession.data(for: request)

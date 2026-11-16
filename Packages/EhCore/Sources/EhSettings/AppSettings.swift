@@ -9,7 +9,7 @@ import Foundation
 // 修复策略:
 // - 需要实时 UI 联动的属性 (listMode, showJpnTitle, isLogin 等) 改为支持 observation
 //   使用 access/withMutation 包裹 UserDefaults 读写，让 @Observable 正常追踪
-// - 不影响 UI 的纯后台配置 (downloadTimeout, downloadDelay 等) 保持 @ObservationIgnored
+// - 不影响 UI 的纯后台配置 (downloadDelay 等) 保持 @ObservationIgnored
 //   避免不必要的 View 重绘
 
 @Observable
@@ -74,6 +74,7 @@ public final class AppSettings: @unchecked Sendable {
         set { _defaults.set(newValue, forKey: "preload_image") }
     }
 
+    /// 下载时每页下完后等待的毫秒数 (对齐 Android download_delay)
     @ObservationIgnored
     public var downloadDelay: Int {
         get { _defaults.integer(forKey: "download_delay") }
@@ -88,11 +89,6 @@ public final class AppSettings: @unchecked Sendable {
         set { _defaults.set(newValue, forKey: "sync_download_while_reading") }
     }
 
-    @ObservationIgnored
-    public var downloadTimeout: Int {
-        get { _defaults.object(forKey: "download_timeout") as? Int ?? 60 }
-        set { _defaults.set(newValue, forKey: "download_timeout") }
-    }
 
     @ObservationIgnored
     public var downloadOriginImage: Bool {
@@ -647,7 +643,6 @@ public final class AppSettings: @unchecked Sendable {
             "built_in_hosts": false,    // iOS URLSession 域名前置不可靠，默认禁用
             "multi_thread_download": 3,
             "preload_image": 5,
-            "download_timeout": 60,
             "read_cache_size": 320,
             // 新增默认值
             "show_tag_translations": true,
