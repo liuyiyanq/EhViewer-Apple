@@ -28,7 +28,7 @@
 ## 行为与契约
 
 允许变化：设置项文案与说明；单本画廊内获取 pToken 的去重方式
-必须保持：全局图片请求并发上限 5（`Packages/EhCore/Sources/EhSettings/EhRateLimiter.swift`）不放宽；暂停、删除、恢复的语义不变；下载顺序仍是队列先进先出
+必须保持：~~全局图片请求并发上限 5（`Packages/EhCore/Sources/EhSettings/EhRateLimiter.swift`）不放宽~~（11-12 由 EH-10 放宽为 10，跟随线程数）；暂停、删除、恢复的语义不变；下载顺序仍是队列先进先出
 
 | 输入或事件 | 预期结果 | 依据 |
 | --- | --- | --- |
