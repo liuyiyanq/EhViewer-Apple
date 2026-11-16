@@ -8,6 +8,9 @@
 import SwiftUI
 import EhModels
 import EhSettings
+#if os(iOS)
+import UIKit
+#endif
 
 struct MainTabView: View {
     @Environment(AppState.self) private var appState
@@ -140,8 +143,9 @@ struct MainTabView: View {
         }
         #else
         // iOS: iPad regular → 侧边栏 NavigationSplitView, iPhone → 底部 TabView
+        // 大屏 iPhone 横屏时也是 regular，不能按它切换：整个界面重建会关掉正在看的阅读器
         Group {
-            if horizontalSizeClass == .regular {
+            if UIDevice.current.userInterfaceIdiom == .pad, horizontalSizeClass == .regular {
                 // iPad 横屏 / 外接键盘: 侧边栏导航
                 NavigationSplitView {
                     List {
