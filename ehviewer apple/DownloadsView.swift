@@ -12,6 +12,7 @@ import EhDownload
 import EhDatabase
 import EhSpider
 import ImageIO
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #else
@@ -31,9 +32,27 @@ enum DownloadStatusFilter: String, CaseIterable, Identifiable {
 }
 
 /// 下载页的显示方式
-enum DownloadsLayoutMode: String {
+enum DownloadsLayoutMode: String, CaseIterable {
     case list
     case grid
+    /// 不显示封面和标题，只看进度
+    case privacy
+
+    var title: String {
+        switch self {
+        case .list: return "列表"
+        case .grid: return "网格"
+        case .privacy: return "隐私"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .list: return "list.bullet"
+        case .grid: return "square.grid.2x2"
+        case .privacy: return "eye.slash"
+        }
+    }
 }
 
 struct DownloadsView: View {
@@ -46,7 +65,9 @@ struct DownloadsView: View {
     // MARK: - 显示方式
     @AppStorage("downloadsLayoutMode") private var layoutMode: DownloadsLayoutMode = .list
     /// 网格中拖动时当前悬停的格子 (条目 id)
-    @State private var gridDropTarget: String?
+    @State private var gridDropTarget: GridDropTarget?
+    /// 隐私视图顶部显示的本机上下行网速
+    @State private var deviceNetworkSpeed = DeviceNetworkSpeedMonitor()
 
     // MARK: - 导航 (进入分组、点封面打开详情页)
     @State private var navigationPath: [DownloadsRoute] = []
@@ -193,6 +214,13 @@ struct DownloadsView: View {
                 .frame(minWidth: 800, minHeight: 600)
         }
         #endif
+        .onChange(of: layoutMode) { _, mode in
+            // 隐私视图只在根目录显示，退出分组和批量选择
+            if mode == .privacy {
+                navigationPath.removeAll()
+                exitSelectMode()
+            }
+        }
         .task {
             // 用户可能在「文件」App 中移动或改名了画廊目录，先按 .ehviewer 重新定位
             await DownloadManager.shared.rescanDownloadDirectory()
@@ -213,8 +241,20 @@ struct DownloadsView: View {
                 storageOverview
             }
 
+            // 账号级错误让队列整体暂停时的提示
+            if isRoot, let reason = vm.haltReason {
+                Label("下载已暂停：\(reason)", systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal)
+                    .padding(.vertical, 8)
+            }
+
             // 内容
-            if entries.isEmpty {
+            if isRoot && layoutMode == .privacy {
+                privacyView
+            } else if entries.isEmpty {
                 ContentUnavailableView(
                     emptyTitle(isRoot: isRoot),
                     systemImage: isRoot ? "arrow.down.circle" : "folder",
@@ -236,7 +276,7 @@ struct DownloadsView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .modifier(RootSearchModifier(enabled: isRoot, text: $searchText))
+        .modifier(RootSearchModifier(enabled: isRoot && layoutMode != .privacy, text: $searchText))
         .toolbar {
             #if os(iOS)
             // 列表在编辑模式下拖动排序 (搜索、筛选、批量选择时不提供；网格直接拖动格子)
@@ -246,6 +286,11 @@ struct DownloadsView: View {
                 }
             }
             #endif
+            if !isSelectMode {
+                ToolbarItem(placement: .automatic) {
+                    layoutModeMenu
+                }
+            }
             ToolbarItem(placement: .automatic) {
                 mainToolbarMenu(group: group)
             }
@@ -727,49 +772,40 @@ struct DownloadsView: View {
                     Label("退出选择", systemImage: "xmark.circle")
                 }
             } else {
-                // 普通模式
-
-                // 状态过滤 (对齐 Android DownloadsScene 状态筛选)
-                Picker("状态过滤", selection: $statusFilter) {
-                    ForEach(DownloadStatusFilter.allCases) { filter in
-                        let count = countForFilter(filter)
-                        if filter == .all {
-                            Text(filter.rawValue).tag(filter)
-                        } else {
-                            Text("\(filter.rawValue) (\(count))").tag(filter)
+                // 普通模式 (隐私视图只保留全部开始、暂停和清空已完成)
+                if layoutMode != .privacy {
+                    // 状态过滤 (对齐 Android DownloadsScene 状态筛选)
+                    Picker("状态过滤", selection: $statusFilter) {
+                        ForEach(DownloadStatusFilter.allCases) { filter in
+                            let count = countForFilter(filter)
+                            if filter == .all {
+                                Text(filter.rawValue).tag(filter)
+                            } else {
+                                Text("\(filter.rawValue) (\(count))").tag(filter)
+                            }
                         }
                     }
-                }
 
-                Button {
-                    layoutMode = layoutMode == .list ? .grid : .list
-                } label: {
-                    if layoutMode == .list {
-                        Label("网格视图", systemImage: "square.grid.2x2")
-                    } else {
-                        Label("列表视图", systemImage: "list.bullet")
+                    Divider()
+
+                    if group == nil {
+                        Button {
+                            newGroupTakesMovingGids = false
+                            showNewGroupAlert = true
+                        } label: {
+                            Label("新建分组", systemImage: "folder.badge.plus")
+                        }
                     }
-                }
 
-                Divider()
-
-                if group == nil {
                     Button {
-                        newGroupTakesMovingGids = false
-                        showNewGroupAlert = true
+                        isSelectMode = true
+                        selectedGids.removeAll()
                     } label: {
-                        Label("新建分组", systemImage: "folder.badge.plus")
+                        Label("批量操作", systemImage: "checkmark.circle")
                     }
-                }
 
-                Button {
-                    isSelectMode = true
-                    selectedGids.removeAll()
-                } label: {
-                    Label("批量操作", systemImage: "checkmark.circle")
+                    Divider()
                 }
-
-                Divider()
 
                 Button {
                     vm.resumeAll()
@@ -796,17 +832,103 @@ struct DownloadsView: View {
         }
     }
 
+    /// 显示方式切换 (列表 / 网格 / 隐私)
+    private var layoutModeMenu: some View {
+        Menu {
+            Picker("显示方式", selection: $layoutMode) {
+                ForEach(DownloadsLayoutMode.allCases, id: \.self) { mode in
+                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                }
+            }
+        } label: {
+            Image(systemName: layoutMode.systemImage)
+        }
+    }
+
+    // MARK: - 隐私视图
+
+    /// 未完成的画廊按状态分段：下载中、等待中 (按队列顺序)、已暂停、失败；没有画廊的状态不显示
+    private var privacySections: [(state: Int, tasks: [DownloadTask])] {
+        [DownloadManager.stateDownload, DownloadManager.stateWait, DownloadManager.stateNone, DownloadManager.stateFailed]
+            .map { state in (state, vm.tasks.filter { $0.state == state }) }
+            .filter { !$0.tasks.isEmpty }
+    }
+
+    private var privacyView: some View {
+        let sections = privacySections
+        let queue = sections
+            .filter { $0.state == DownloadManager.stateDownload || $0.state == DownloadManager.stateWait }
+            .flatMap(\.tasks)
+        let downloaded = queue.reduce(0) { $0 + min($1.downloadedPages, $1.gallery.pages) }
+        let total = queue.reduce(0) { $0 + $1.gallery.pages }
+        let progress = total > 0 ? Double(downloaded) / Double(total) : 0
+
+        return List {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text(queue.isEmpty ? "队列为空" : "队列中 \(queue.count) 本")
+                            .font(.headline)
+                        Spacer()
+                        // 本机网速，含其他 App 的流量；每本画廊行里仍显示 App 自己的下载速度
+                        HStack(spacing: 10) {
+                            Label(DownloadTaskRow.formatSpeed(deviceNetworkSpeed.downloadSpeed), systemImage: "arrow.down")
+                                .foregroundStyle(.blue)
+                            Label(DownloadTaskRow.formatSpeed(deviceNetworkSpeed.uploadSpeed), systemImage: "arrow.up")
+                                .foregroundStyle(.green)
+                        }
+                        .font(.subheadline)
+                        .monospacedDigit()
+                    }
+                    ProgressView(value: progress)
+                    HStack {
+                        Text("\(downloaded)/\(total) 页")
+                        Spacer()
+                        Text("\(Int(progress * 100))%")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                }
+                .padding(.vertical, 4)
+            }
+
+            // 序号跨段连续编号
+            ForEach(Array(sections.enumerated()), id: \.element.state) { sectionIndex, section in
+                let offset = sections[..<sectionIndex].reduce(0) { $0 + $1.tasks.count }
+                Section("\(DownloadTaskRow.statusText(state: section.state)) \(section.tasks.count)") {
+                    ForEach(Array(section.tasks.enumerated()), id: \.element.gallery.gid) { index, task in
+                        let gid = task.gallery.gid
+                        PrivacyTaskRow(
+                            index: offset + index + 1,
+                            task: task,
+                            onPause: { vm.pauseTask(gid: gid) },
+                            onResume: { vm.resumeTask(gid: gid) }
+                        )
+                    }
+                }
+            }
+        }
+        .listStyle(.plain)
+        .onAppear { deviceNetworkSpeed.start() }
+        .onDisappear { deviceNetworkSpeed.stop() }
+        #if os(iOS)
+        // 停留在隐私视图时不自动锁屏，下载保持在前台进行
+        .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
+        #endif
+    }
+
     // MARK: - 下载列表
 
     private func downloadList(entries: [DownloadListEntry], group: String?) -> some View {
-        let positions = queuePositions
-        return List {
+        List {
             ForEach(entries) { entry in
                 switch entry {
                 case .group(let downloadGroup, let tasks):
                     groupRow(downloadGroup, tasks: tasks)
                 case .gallery(let task):
-                    galleryRow(task, queuePosition: positions[task.gallery.gid])
+                    galleryRow(task)
                 }
             }
             .onMove(perform: moveAction(entries, group: group))
@@ -846,18 +968,11 @@ struct DownloadsView: View {
         }
     }
 
-    /// 等待中画廊的排队位置，1 表示下一本开始下载
-    private var queuePositions: [Int64: Int] {
-        let waiting = vm.tasks.filter { $0.state == DownloadManager.stateWait }
-        return Dictionary(waiting.enumerated().map { ($1.gallery.gid, $0 + 1) }, uniquingKeysWith: { first, _ in first })
-    }
-
     @ViewBuilder
-    private func galleryRow(_ task: DownloadTask, queuePosition: Int?) -> some View {
+    private func galleryRow(_ task: DownloadTask) -> some View {
         let gid = task.gallery.gid
         let row = DownloadTaskRow(
             task: task,
-            queuePosition: queuePosition,
             readingPage: readingProgress[gid],
             storageSize: gallerySizes[gid],
             groupName: isFiltering ? vm.layout.placement(of: gid).group.map { DownloadGroup(dirname: $0).name } : nil,
@@ -926,24 +1041,20 @@ struct DownloadsView: View {
     // MARK: - 下载网格
 
     private func downloadGrid(entries: [DownloadListEntry], group: String?) -> some View {
-        let positions = queuePositions
-        return ScrollView {
+        ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 12)], alignment: .leading, spacing: 16) {
                 ForEach(entries) { entry in
-                    gridCell(entry, queuePosition: entry.galleryGid.flatMap { positions[$0] })
+                    gridCell(entry)
                         .overlay {
-                            if gridDropTarget == entry.id {
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.accentColor, lineWidth: 2)
-                                    .padding(-4)
-                            }
+                            gridDropIndicator(for: entry)
                         }
                         .modifier(GridDragDropModifier(
                             enabled: canReorder,
                             payload: entry.id,
-                            targetID: $gridDropTarget
-                        ) { payloads in
-                            handleGridDrop(payloads, onto: entry, group: group)
+                            acceptsInto: entry.galleryGid == nil,
+                            target: $gridDropTarget
+                        ) { payloads, position in
+                            handleGridDrop(payloads, onto: entry, position: position, group: group)
                         })
                 }
             }
@@ -951,8 +1062,29 @@ struct DownloadsView: View {
         }
     }
 
+    /// 拖动悬停时的落点提示：前后为格子间隙里的竖线，移入文件夹为整格描边
     @ViewBuilder
-    private func gridCell(_ entry: DownloadListEntry, queuePosition: Int?) -> some View {
+    private func gridDropIndicator(for entry: DownloadListEntry) -> some View {
+        if let target = gridDropTarget, target.id == entry.id {
+            switch target.position {
+            case .into:
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor, lineWidth: 2)
+                    .padding(-4)
+            case .before, .after:
+                // 列间距 12，竖线宽 4，偏移 8 让它落在间隙正中
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(width: 4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity,
+                           alignment: target.position == .before ? .leading : .trailing)
+                    .offset(x: target.position == .before ? -8 : 8)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func gridCell(_ entry: DownloadListEntry) -> some View {
         switch entry {
         case .group(let downloadGroup, let tasks):
             NavigationLink(value: DownloadsRoute.group(downloadGroup.dirname)) {
@@ -973,7 +1105,6 @@ struct DownloadsView: View {
             } label: {
                 DownloadGalleryTile(
                     task: task,
-                    queuePosition: queuePosition,
                     readingPage: readingProgress[gid],
                     selection: isSelectMode ? selectedGids.contains(gid) : nil
                 )
@@ -996,14 +1127,15 @@ struct DownloadsView: View {
         }
     }
 
-    /// 网格中松手：画廊拖到文件夹上是移入分组；其余情况被拖的项占据目标格子的位置
-    /// (向后拖落在目标之后，向前拖落在目标之前)
-    private func handleGridDrop(_ payloads: [String], onto target: DownloadListEntry, group: String?) -> Bool {
+    /// 网格中松手：落在文件夹中间是把画廊移入分组；落在格子左半边插到它前面，右半边插到它后面
+    private func handleGridDrop(
+        _ payloads: [String], onto target: DownloadListEntry, position: GridDropPosition, group: String?
+    ) -> Bool {
         let entries = listEntries(inGroup: group)
         let dragged = payloads.compactMap { id in entries.first { $0.id == id } }
         guard !dragged.isEmpty, !dragged.contains(where: { $0.id == target.id }) else { return false }
 
-        if case .group(let targetGroup, _) = target {
+        if position == .into, case .group(let targetGroup, _) = target {
             let gids = dragged.compactMap(\.galleryGid)
             if gids.count == dragged.count {
                 Task { await vm.moveGalleries(gids, toGroup: targetGroup.dirname) }
@@ -1014,7 +1146,12 @@ struct DownloadsView: View {
         guard dragged.count == 1,
               let from = entries.firstIndex(where: { $0.id == dragged[0].id }),
               let to = entries.firstIndex(where: { $0.id == target.id }) else { return false }
-        moveEntries(entries, from: IndexSet(integer: from), to: to > from ? to + 1 : to, group: group)
+        // 文件夹拖到文件夹中间不能移入，按原来的"占据目标位置"处理
+        let insertAfter = position == .after || (position == .into && to > from)
+        let offset = insertAfter ? to + 1 : to
+        // 插入点就在自己前后，位置不变
+        guard offset != from, offset != from + 1 else { return false }
+        moveEntries(entries, from: IndexSet(integer: from), to: offset, group: group)
         return true
     }
 
@@ -1219,29 +1356,92 @@ private struct GalleryDropModifier: ViewModifier {
     }
 }
 
-/// 网格格子既可拖动也可接收拖放；悬停时把自己的 id 写进 targetID 用于高亮
+/// 网格中拖放的落点
+private enum GridDropPosition: Equatable {
+    case before, after
+    /// 移入文件夹
+    case into
+}
+
+private struct GridDropTarget: Equatable {
+    let id: String
+    let position: GridDropPosition
+}
+
+/// 网格格子既可拖动也可接收拖放；悬停时按指针位置算出落点写进 target，用于显示插入线或文件夹高亮
 private struct GridDragDropModifier: ViewModifier {
     let enabled: Bool
     let payload: String
-    @Binding var targetID: String?
-    let onDrop: ([String]) -> Bool
+    /// 文件夹：中间一半区域表示移入，两侧表示排在它前后
+    let acceptsInto: Bool
+    @Binding var target: GridDropTarget?
+    let onDrop: ([String], GridDropPosition) -> Bool
+
+    @State private var width: CGFloat = 0
 
     func body(content: Content) -> some View {
         if enabled {
             content
                 .draggable(payload)
-                .dropDestination(for: String.self) { items, _ in
-                    targetID = nil
-                    return onDrop(items)
-                } isTargeted: { targeted in
-                    if targeted {
-                        targetID = payload
-                    } else if targetID == payload {
-                        targetID = nil
-                    }
-                }
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+                .onDrop(of: [.text], delegate: GridDropDelegate(
+                    id: payload, acceptsInto: acceptsInto, width: width, target: $target, onDrop: onDrop
+                ))
         } else {
             content
+        }
+    }
+}
+
+/// 用 DropDelegate 而不是 dropDestination：拖动过程中要持续拿到指针位置才能显示插入线
+private struct GridDropDelegate: DropDelegate {
+    let id: String
+    let acceptsInto: Bool
+    let width: CGFloat
+    @Binding var target: GridDropTarget?
+    let onDrop: ([String], GridDropPosition) -> Bool
+
+    private func position(_ info: DropInfo) -> GridDropPosition {
+        let x = info.location.x
+        if acceptsInto, x > width * 0.25, x < width * 0.75 { return .into }
+        return x < width / 2 ? .before : .after
+    }
+
+    func dropEntered(info: DropInfo) {
+        target = GridDropTarget(id: id, position: position(info))
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        let next = GridDropTarget(id: id, position: position(info))
+        if target != next { target = next }
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        if target?.id == id { target = nil }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let dropPosition = position(info)
+        target = nil
+        let providers = info.itemProviders(for: [.text])
+        guard !providers.isEmpty else { return false }
+        Task {
+            var payloads: [String] = []
+            for provider in providers {
+                if let text = await Self.loadText(provider) { payloads.append(text) }
+            }
+            _ = onDrop(payloads, dropPosition)
+        }
+        return true
+    }
+
+    /// 回调在后台线程，标成 @Sendable 避免被推断为主线程隔离
+    nonisolated private static func loadText(_ provider: NSItemProvider) async -> String? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            _ = provider.loadObject(ofClass: String.self) { @Sendable text, _ in
+                continuation.resume(returning: text)
+            }
         }
     }
 }
@@ -1251,7 +1451,6 @@ private struct GridDragDropModifier: ViewModifier {
 /// 网格中的画廊：2:3 封面 + 两行标题 + 一行状态
 struct DownloadGalleryTile: View {
     let task: DownloadTask
-    let queuePosition: Int?
     let readingPage: Int?
     /// 批量选择时是否选中；不在选择模式时为 nil
     let selection: Bool?
@@ -1324,7 +1523,7 @@ struct DownloadGalleryTile: View {
         case DownloadManager.stateDownload:
             return "下载中 · \(Int(downloadProgress * 100))%"
         default:
-            return DownloadTaskRow.statusText(state: task.state, queuePosition: queuePosition)
+            return DownloadTaskRow.statusText(task: task)
         }
     }
 }
@@ -1630,6 +1829,61 @@ struct DownloadTaskMenu: View {
     }
 }
 
+/// 隐私视图的一行：只有序号和进度 (状态见段头)，不显示封面、标题，点击不打开任何页面
+private struct PrivacyTaskRow: View {
+    let index: Int
+    let task: DownloadTask
+    let onPause: () -> Void
+    let onResume: () -> Void
+
+    private var isActive: Bool {
+        task.state == DownloadManager.stateDownload || task.state == DownloadManager.stateWait
+    }
+
+    private var progress: Double {
+        guard task.gallery.pages > 0 else { return 0 }
+        return min(1, Double(task.downloadedPages) / Double(task.gallery.pages))
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("#\(index)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .frame(minWidth: 36, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ProgressView(value: progress)
+                HStack {
+                    Text("\(task.downloadedPages)/\(task.gallery.pages) 页 · \(Int(progress * 100))%")
+                    Spacer()
+                    if task.state == DownloadManager.stateDownload, task.speed > 0 {
+                        Text(DownloadTaskRow.formatSpeed(task.speed))
+                            .foregroundStyle(.blue)
+                    } else if task.state == DownloadManager.stateFailed, let reason = task.failureReason {
+                        Text(reason)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            }
+
+            Button {
+                isActive ? onPause() : onResume()
+            } label: {
+                Image(systemName: isActive ? "pause.circle" : "play.circle")
+                    .font(.title2)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 /// 下载状态图标
 struct DownloadStatusIcon: View {
     let state: Int
@@ -1658,7 +1912,6 @@ struct DownloadStatusIcon: View {
 
 struct DownloadTaskRow: View {
     let task: DownloadTask
-    let queuePosition: Int?    // 等待中时的排队位置
     let readingPage: Int?      // 阅读进度 (当前页索引)
     let storageSize: Int64?    // 画廊占用空间 (字节)
     let groupName: String?     // 所属分组 (搜索/筛选平铺显示时注明)
@@ -1703,9 +1956,10 @@ struct DownloadTaskRow: View {
                 HStack(spacing: 6) {
                     DownloadStatusIcon(state: task.state)
                         .font(.caption)
-                    Text(Self.statusText(state: task.state, queuePosition: queuePosition))
+                    Text(Self.statusText(task: task))
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
 
                     Spacer()
 
@@ -1797,11 +2051,18 @@ struct DownloadTaskRow: View {
         }
     }
 
-    /// 状态文字，列表行与网格格子共用
-    static func statusText(state: Int, queuePosition: Int?) -> String {
+    /// 状态文字，失败时带上原因
+    static func statusText(task: DownloadTask) -> String {
+        let text = statusText(state: task.state)
+        guard task.state == DownloadManager.stateFailed, let reason = task.failureReason else { return text }
+        return "\(text) · \(reason)"
+    }
+
+    /// 状态文字，列表行、网格格子与隐私模式分段共用
+    static func statusText(state: Int) -> String {
         switch state {
         case DownloadManager.stateDownload: return "下载中"
-        case DownloadManager.stateWait: return queuePosition.map { "等待中 · 第 \($0) 位" } ?? "等待中"
+        case DownloadManager.stateWait: return "等待中"
         case DownloadManager.stateFinish: return "已完成"
         case DownloadManager.stateFailed: return "失败"
         default: return "已暂停"
@@ -1829,6 +2090,8 @@ struct DownloadTaskRow: View {
 @Observable
 class DownloadsViewModel {
     var tasks: [DownloadTask] = []
+    /// 队列因 509、IP 封禁等整体暂停的原因
+    var haltReason: String?
     /// 分组与每本画廊的位置 (来自下载目录结构)
     var layout = DownloadLayout()
     /// 分组、移动、排序失败时的提示
@@ -1838,6 +2101,7 @@ class DownloadsViewModel {
 
     func loadTasks() async {
         tasks = await DownloadManager.shared.getAllTasks()
+        haltReason = await DownloadManager.shared.haltReason
         layout = await DownloadManager.shared.directoryLayout()
         updateRefreshTimer()
     }
@@ -1893,6 +2157,7 @@ class DownloadsViewModel {
                 guard let self else { return }
                 Task { @MainActor in
                     self.tasks = await DownloadManager.shared.getAllTasks()
+                    self.haltReason = await DownloadManager.shared.haltReason
                     // 如果没有活跃下载了，停止定时器
                     let stillActive = self.tasks.contains(where: {
                         $0.state == DownloadManager.stateDownload || $0.state == DownloadManager.stateWait
@@ -1986,6 +2251,82 @@ enum StorageUtils: Sendable {
         if mb < 1024 { return String(format: "%.1f MB", mb) }
         let gb = mb / 1024.0
         return String(format: "%.2f GB", gb)
+    }
+}
+
+// MARK: - 本机网速
+
+/// 本机上下行网速：每秒读一次各网卡的累计收发字节数取差，包含其他 App 的流量
+@Observable
+final class DeviceNetworkSpeedMonitor {
+    private(set) var downloadSpeed: Int64 = 0
+    private(set) var uploadSpeed: Int64 = 0
+
+    private var lastCounters: [String: (rx: UInt64, tx: UInt64)] = [:]
+    private var lastTime: Date?
+    private var timer: Timer?
+
+    func start() {
+        guard timer == nil else { return }
+        lastCounters = [:]
+        lastTime = nil
+        sample()
+        // 定时器加在主线程 RunLoop 上，回调本来就在主线程
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.sample() }
+        }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        downloadSpeed = 0
+        uploadSpeed = 0
+    }
+
+    private func sample() {
+        let counters = Self.readCounters()
+        let now = Date()
+        if let lastTime, now.timeIntervalSince(lastTime) > 0 {
+            var rx: UInt64 = 0
+            var tx: UInt64 = 0
+            // 按网卡分别取差：切换 Wi-Fi / 蜂窝时新出现的网卡从下一秒开始计
+            for (name, current) in counters {
+                guard let previous = lastCounters[name] else { continue }
+                rx += Self.delta(current.rx, previous.rx)
+                tx += Self.delta(current.tx, previous.tx)
+            }
+            let elapsed = now.timeIntervalSince(lastTime)
+            downloadSpeed = Int64(Double(rx) / elapsed)
+            uploadSpeed = Int64(Double(tx) / elapsed)
+        }
+        lastCounters = counters
+        lastTime = now
+    }
+
+    /// 系统计数器是 32 位，超过 4 GB 会从 0 重新开始
+    private static func delta(_ current: UInt64, _ previous: UInt64) -> UInt64 {
+        current >= previous ? current - previous : current + (1 << 32) - previous
+    }
+
+    /// 只统计物理网卡 (Wi-Fi 与有线 en*、蜂窝 pdp_ip*)：VPN 隧道 (utun、ipsec) 的流量同样经过物理网卡，再算会重复
+    nonisolated private static func readCounters() -> [String: (rx: UInt64, tx: UInt64)] {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return [:] }
+        defer { freeifaddrs(addresses) }
+
+        var result: [String: (rx: UInt64, tx: UInt64)] = [:]
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let interface = pointer.pointee
+            guard let address = interface.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_LINK),
+                  let data = interface.ifa_data else { continue }
+            let name = String(cString: interface.ifa_name)
+            guard name.hasPrefix("en") || name.hasPrefix("pdp_ip") else { continue }
+            let stats = data.assumingMemoryBound(to: if_data.self).pointee
+            result[name] = (UInt64(stats.ifi_ibytes), UInt64(stats.ifi_obytes))
+        }
+        return result
     }
 }
 
