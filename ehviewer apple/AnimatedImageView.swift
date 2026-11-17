@@ -12,8 +12,8 @@ import SwiftUI
 import UIKit
 
 /// iOS: 使用 UIImageView 播放 GIF 动画
-/// UIImage(data: gifData) 会自动解析 GIF 帧 → images 数组、duration
-/// UIImageView 自动循环播放
+/// 传入的必须是 UIImage.animatedImage 拼好的动图 (UIImage(data:) 解 GIF 只有第一帧，
+/// 阅读器在 ReaderViewModel.animatedImage 里逐帧解码)；UIImageView 自动循环播放
 struct AnimatedImageView: UIViewRepresentable {
     let image: UIImage
     var contentMode: UIView.ContentMode = .scaleAspectFit

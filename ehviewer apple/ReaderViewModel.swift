@@ -205,18 +205,22 @@ class ReaderViewModel {
 
     /// 降采样解码: 用 ImageIO 在解码阶段限制像素尺寸，而非先全量解码再缩放
     /// 一张 15000×20000 JPEG 全量解码 = 1.2GB; 降采样到 4096px 宽 ≈ 40MB
-    /// 对于 GIF 动画: 直接使用 PlatformImage(data:) 保留所有帧，不做降采样
+    /// 对于 GIF 等动图: iOS 逐帧解码拼成动图；macOS 的 NSImage(data:) 本身保留所有帧
     nonisolated private static func downsampledImage(data: Data) -> PlatformImage? {
         let options: [CFString: Any] = [
             kCGImageSourceShouldCache: false  // 不缓存原始数据
         ]
         guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else { return nil }
 
-        // GIF 动画检测: 多帧图片直接解码，保留动画帧
-        // CGImageSourceCreateThumbnailAtIndex 只提取第一帧, 会丢失动画
+        // 动图检测: 多帧图片要保留所有帧
         let frameCount = CGImageSourceGetCount(source)
         if frameCount > 1 {
+            #if os(iOS)
+            // iOS 的 UIImage(data:) 解 GIF 只得到第一帧，必须逐帧解码
+            return animatedImage(source: source, frameCount: frameCount) ?? PlatformImage(data: data)
+            #else
             return PlatformImage(data: data)
+            #endif
         }
 
         // 获取原图尺寸
@@ -264,9 +268,69 @@ class ReaderViewModel {
         #endif
     }
 
+    #if os(iOS)
+    /// 动图每帧最长边上限：屏幕显示足够，避免几百帧按原尺寸解码
+    nonisolated private static let animatedFrameMaxPixelSize: CGFloat = 1500
+    /// 动图所有帧解码后的内存上限，超过只显示第一帧
+    nonisolated private static let animatedImageMaxBytes = 150 * 1024 * 1024
+
+    /// 逐帧解码多帧图片 (GIF、APNG、动态 WebP)，按每帧的停留时间拼成动图
+    nonisolated private static func animatedImage(source: CGImageSource, frameCount: Int) -> UIImage? {
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: animatedFrameMaxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let firstFrame = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
+            return nil
+        }
+        // 先按第一帧估算总内存，太大就只显示第一帧
+        let bytesPerFrame = firstFrame.bytesPerRow * firstFrame.height
+        guard bytesPerFrame * frameCount <= animatedImageMaxBytes else {
+            return UIImage(cgImage: firstFrame)
+        }
+
+        var frames = [UIImage(cgImage: firstFrame)]
+        var duration = frameDelay(source: source, index: 0)
+        for index in 1..<frameCount {
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, index, thumbOpts as CFDictionary) else {
+                continue
+            }
+            frames.append(UIImage(cgImage: cgImage))
+            duration += frameDelay(source: source, index: index)
+        }
+        guard frames.count > 1 else { return frames[0] }
+        return UIImage.animatedImage(with: frames, duration: duration)
+    }
+
+    /// 单帧停留时间；过小的值按 0.1 秒处理 (与浏览器一致，否则会快得看不清)
+    nonisolated private static func frameDelay(source: CGImageSource, index: Int) -> TimeInterval {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] else {
+            return 0.1
+        }
+        let formats: [(dictionary: CFString, unclamped: CFString, clamped: CFString)] = [
+            (kCGImagePropertyGIFDictionary, kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyGIFDelayTime),
+            (kCGImagePropertyPNGDictionary, kCGImagePropertyAPNGUnclampedDelayTime, kCGImagePropertyAPNGDelayTime),
+            (kCGImagePropertyWebPDictionary, kCGImagePropertyWebPUnclampedDelayTime, kCGImagePropertyWebPDelayTime),
+        ]
+        for format in formats {
+            guard let info = properties[format.dictionary] as? [CFString: Any] else { continue }
+            let unclamped = info[format.unclamped] as? Double ?? 0
+            let delay = unclamped > 0 ? unclamped : (info[format.clamped] as? Double ?? 0)
+            return delay < 0.02 ? 0.1 : delay
+        }
+        return 0.1
+    }
+    #endif
+
     /// 计算解码后图片的实际像素内存占用 (bytes)
     nonisolated private static func decodedCost(of image: PlatformImage) -> Int {
         #if os(iOS)
+        // 动图的 cgImage 为 nil，按帧数 × 每帧大小计算
+        if let frames = image.images, let frame = frames.first?.cgImage {
+            return frame.bytesPerRow * frame.height * frames.count
+        }
         guard let cg = image.cgImage else { return 1024 * 1024 } // 1MB fallback
         return cg.bytesPerRow * cg.height
         #else
