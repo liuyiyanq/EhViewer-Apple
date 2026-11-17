@@ -99,6 +99,8 @@ struct DownloadsView: View {
 
     // MARK: - 阅读器 (fullScreenCover 呈现，隐藏导航栏)
     @State private var readerGallery: GalleryInfo?
+    /// 详情页点标签后弹出的标签搜索页：下载页导航栈只放 DownloadsRoute，推不进搜索页
+    @State private var tagSearch: TagSearchDestination?
 
     // MARK: - 存储信息
     @State private var gallerySizes: [Int64: Int64] = [:]  // gid -> bytes
@@ -115,8 +117,34 @@ struct DownloadsView: View {
                         levelView(group: dirname)
                     case .gallery(let gallery):
                         GalleryDetailView(gallery: gallery)
+                            .environment(\.tagNavigationAction, TagNavigationAction { tag in
+                                tagSearch = TagSearchDestination(tag: tag)
+                            })
                     }
                 }
+        }
+        // 标签搜索：自带导航栈，在里面可以继续打开画廊、点标签
+        .sheet(item: $tagSearch) { destination in
+            NavigationStack {
+                GalleryListView(mode: .tag(keyword: destination.tag), isPushed: true)
+                    .navigationDestination(for: GalleryInfo.self) { gallery in
+                        GalleryDetailView(gallery: gallery)
+                            .id(gallery.gid)
+                    }
+                    .navigationDestination(for: TagSearchDestination.self) { dest in
+                        GalleryListView(mode: .tag(keyword: dest.tag), isPushed: true)
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("关闭") { tagSearch = nil }
+                        }
+                    }
+            }
+            // 弹出页里点标签推入自己的导航栈，不沿用外层的跳转方式
+            .environment(\.tagNavigationAction, nil)
+            #if os(macOS)
+            .frame(minWidth: 600, minHeight: 500)
+            #endif
         }
         // 移动到分组 Sheet
         .sheet(isPresented: $showMoveToGroupSheet) {
@@ -1277,6 +1305,10 @@ struct DownloadsView: View {
 // MARK: - 列表项
 
 /// 下载页的导航目标
+extension TagSearchDestination: Identifiable {
+    var id: String { tag }
+}
+
 private enum DownloadsRoute: Hashable {
     /// 进入分组 (目录名)
     case group(String)

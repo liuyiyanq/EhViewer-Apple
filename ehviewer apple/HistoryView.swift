@@ -32,6 +32,10 @@ struct HistoryView: View {
                             GalleryDetailView(gallery: gallery)
                                 .id(gallery.gid)
                         }
+                        // 详情页点标签的 NavigationLink(value: TagSearchDestination) 需要此 destination
+                        .navigationDestination(for: TagSearchDestination.self) { dest in
+                            GalleryListView(mode: .tag(keyword: dest.tag), isPushed: true)
+                        }
                 }
             }
         }
