@@ -240,7 +240,7 @@ mkdir -p build/Payload && cp -R build/EhViewer.xcarchive/Products/Applications/*
 
 版本号与发布：
 
-- 每次打包前更新 `MARKETING_VERSION`（主 App 和小组件保持一致）和 `CURRENT_PROJECT_VERSION`，本期定为 1.3.2（用户 11-12 确认），`CURRENT_PROJECT_VERSION` 保持 1
+- 每次打包前更新 `MARKETING_VERSION`（主 App 和小组件保持一致）和 `CURRENT_PROJECT_VERSION`，本期定为 1.3.2（用户 11-12 确认），11-17 升为 1.3.3（用户确认），`CURRENT_PROJECT_VERSION` 保持 1
 - 在 fork 上创建 Release（tag 与版本号一致，附 IPA）后，已安装的 App 才能检查到更新。创建 tag、Release 和上传都要用户确认
 
 ## 任务卡更新规则
@@ -312,3 +312,6 @@ mkdir -p build/Payload && cp -R build/EhViewer.xcarchive/Products/Applications/*
 - 隐私模式顶部右侧改为本机下载 ↓ / 上传 ↑ 速度（按网卡字节数，不含 VPN 隧道），见 EH-9 决策 6。未提交
 - 11-16：去掉「单张超时」设置（总时长不限）；下载失败不再带 `nl=` 换节点，改为同地址重试 → 不带 `nl=` 重新要地址，见 EH-10 决策 5、6（决策 3 作废）。未提交
 - 11-16：大屏 iPhone 横屏时主界面不再切换为侧边栏布局，避免阅读器被关闭（`MainTabView` 只在 iPad 上按 sizeClass 切换）。未提交
+- 11-16：下载页进入的详情页点标签没反应（下载页导航栈推不进搜索页），改为弹出标签搜索页，见 EH-5 决策 5；历史页补登记标签搜索页，原地推入。未提交
+- 11-17：iPhone 阅读器 GIF 只显示第一帧（在线和本地共用的解码函数用 `UIImage(data:)`，iOS 上只解出第一帧）。改为逐帧解码拼成动图，每帧最长边 1500 像素，总内存超 150 MB 只显示第一帧；动图缓存占用按帧数计算。Mac 不受影响。未提交
+- 11-17：版本升为 1.3.3（主 App 与小组件的 `MARKETING_VERSION`、README 徽章），build 号保持 1。未提交
